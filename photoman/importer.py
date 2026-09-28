@@ -248,12 +248,14 @@ class Index:
                    PRIMARY KEY (sha256, backup_root))"""
         )
         self.db.execute(
-            """CREATE TABLE IF NOT EXISTS cloud (
-                   rel_path TEXT PRIMARY KEY,
+            """CREATE TABLE IF NOT EXISTS cloud_uploads (
+                   rel_path TEXT NOT NULL,
+                   remote_root TEXT NOT NULL,
                    size INTEGER NOT NULL,
                    mtime REAL NOT NULL,
                    fs_id TEXT,
-                   uploaded_at TEXT NOT NULL)"""
+                   uploaded_at TEXT NOT NULL,
+                   PRIMARY KEY (rel_path, remote_root))"""
         )
 
     def by_hash(self, sha: str) -> Optional[str]:
@@ -285,13 +287,18 @@ class Index:
         self.db.execute("INSERT OR REPLACE INTO backups VALUES (?,?,?,?)",
                         (sha, str(backup_root), rel_path, datetime.now().isoformat(timespec="seconds")))
 
-    def cloud_of(self, rel_path: str) -> Optional[tuple]:
-        """(size, mtime) of the version of `rel_path` last uploaded to Baidu Netdisk."""
-        return self.db.execute("SELECT size, mtime FROM cloud WHERE rel_path=?", (rel_path,)).fetchone()
+    def cloud_of(self, rel_path: str, remote_root: str) -> Optional[tuple]:
+        """(size, mtime) of the version of `rel_path` last uploaded under `remote_root` in Baidu Netdisk."""
+        return self.db.execute("SELECT size, mtime FROM cloud_uploads WHERE rel_path=? AND remote_root=?",
+                               (rel_path, remote_root)).fetchone()
 
-    def mark_cloud(self, rel_path: str, size: int, mtime: float, fs_id: str = "") -> None:
-        self.db.execute("INSERT OR REPLACE INTO cloud VALUES (?,?,?,?,?)",
-                        (rel_path, size, mtime, fs_id, datetime.now().isoformat(timespec="seconds")))
+    def cloud_uploads(self, remote_root: str) -> dict:
+        return {r[0]: (r[1], r[2]) for r in self.db.execute(
+            "SELECT rel_path, size, mtime FROM cloud_uploads WHERE remote_root=?", (remote_root,))}
+
+    def mark_cloud(self, rel_path: str, remote_root: str, size: int, mtime: float, fs_id: str = "") -> None:
+        self.db.execute("INSERT OR REPLACE INTO cloud_uploads VALUES (?,?,?,?,?,?)",
+                        (rel_path, remote_root, size, mtime, fs_id, datetime.now().isoformat(timespec="seconds")))
 
     def commit(self):
         self.db.commit()

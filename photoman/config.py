@@ -31,6 +31,9 @@ DEFAULT_CONFIG = {
     #   Baidu Netdisk: "jpeg" (JPEG/HEIF only), "raw", "all" or "none". Edited exports are always included.
     "backup_originals": "raw",
     "cloud_originals": "jpeg",
+    # Baidu Netdisk folder to upload into, e.g. "/照片备份". Empty: the app's own folder,
+    # 我的应用数据/<app name> (/apps/<app name>)
+    "cloud_root": "",
     # Within this many days of the last import, the trip name defaults to the previous one
     "trip_name_reuse_days": 3,
 }

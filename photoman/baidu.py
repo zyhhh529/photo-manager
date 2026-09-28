@@ -4,9 +4,11 @@ Setup: register an app on the open platform to get an AppKey and SecretKey, then
 device-code flow (the user enters a code on a Baidu page). Tokens are kept in ~/.photoman/baidu.json (mode 600)
 and refreshed automatically.
 
-Uploads go straight from the library drive to /apps/<app name>/<same relative path>, in chunks whose MD5s the
+Uploads go straight from the library drive to <cloud root>/<same relative path>, in chunks whose MD5s the
 server confirms. Which files are uploaded is recorded in the library's index, so uploads resume where they left
-off, on any day. Nothing is ever deleted in the cloud; a re-exported edit replaces its older upload.
+off, on any day. Photoman can only upload: every request is checked against ALLOWED_CALLS and must target
+the cloud root (config "cloud_root", default /apps/<app name>), so it can't delete, move or rename anything.
+A re-exported edit replaces its older upload.
 """
 from __future__ import annotations
 
@@ -34,8 +36,24 @@ CHUNK_BY_VIP = {0: 4 * MB, 1: 16 * MB, 2: 32 * MB}   # regular / VIP / SVIP
 REFRESH_BEFORE = 24 * 3600                          # refresh the 30-day token a day early
 
 
+# The only Baidu calls Photoman may make: authorization, account info and uploading. Anything else
+# (deleting, moving, renaming, listing other folders...) is refused before a request is sent.
+ALLOWED_CALLS = {
+    ("/oauth/2.0/device/code", None),
+    ("/oauth/2.0/token", None),
+    ("/rest/2.0/xpan/nas", "uinfo"),
+    ("/rest/2.0/xpan/file", "precreate"),
+    ("/rest/2.0/pcs/superfile2", "upload"),
+    ("/rest/2.0/xpan/file", "create"),
+}
+
+
 class BaiduError(Exception):
     pass
+
+
+class ForbiddenCall(BaiduError):
+    """A call outside ALLOWED_CALLS, or a path outside the app's own upload folder."""
 
 
 class BaiduAuthError(BaiduError):
@@ -56,7 +74,37 @@ def _multipart(fields: dict, files: dict):
     return b"".join(parts), f"multipart/form-data; boundary={boundary}"
 
 
+def _check_allowed(url: str, params: dict, data: dict) -> None:
+    path = urllib.parse.urlparse(url).path
+    endpoint = next((e for e, _ in ALLOWED_CALLS if path.endswith(e)), None)
+    if (endpoint, (params or {}).get("method")) not in ALLOWED_CALLS:
+        raise ForbiddenCall(f"Photoman only uploads to Baidu Netdisk; refusing {path} {params and params.get('method')}")
+    target = (params or {}).get("path") or (data or {}).get("path")
+    if target is not None:
+        root = cloud_root()
+        if not str(target).startswith(root + "/") or "/.." in str(target):
+            raise ForbiddenCall(f"Refusing to write outside {root}/: {target}")
+
+
+def cloud_root(creds: Optional[dict] = None) -> str:
+    """The Baidu Netdisk folder Photoman uploads into: config "cloud_root" (e.g. /照片备份), or the app's own
+    folder /apps/<app name> (shown as 我的应用数据/<app name>). Never the whole netdisk."""
+    raw = (config.load_config().get("cloud_root") or "").strip()
+    if raw and not raw.strip("/"):
+        raise ForbiddenCall("The upload folder can't be the whole netdisk (/): use a folder such as /照片备份")
+    root = raw.rstrip("/")
+    if not root:
+        app = (load_credentials() if creds is None else creds).get("app_name")
+        if not app:
+            raise ForbiddenCall("No upload folder: set up Baidu Netdisk first")
+        root = f"/apps/{app}"
+    if not root.startswith("/") or root == "/" or ".." in root.split("/"):
+        raise ForbiddenCall(f"Invalid upload folder {root!r}: use a folder such as /照片备份")
+    return root
+
+
 def _http(url: str, params: dict = None, data: dict = None, files: dict = None, timeout: float = 120) -> dict:
+    _check_allowed(url, params, data)
     if params:
         url += ("&" if "?" in url else "?") + urllib.parse.urlencode(params)
     headers = {"User-Agent": "pan.baidu.com"}
@@ -171,11 +219,15 @@ class Baidu:
             self._chunk = CHUNK_BY_VIP.get(vip, 4 * MB)
         return self._chunk
 
+    @property
+    def root(self) -> str:
+        return cloud_root(self.creds)
+
     def remote_path(self, rel: str) -> str:
-        return f"/apps/{self.creds['app_name']}/{rel}"
+        return f"{self.root}/{rel}"
 
     def upload(self, local: Path, rel: str) -> dict:
-        """Upload `local` to /apps/<app>/<rel>, replacing any older upload there. Every chunk's MD5 is
+        """Upload `local` to <cloud root>/<rel>, replacing any older upload there. Every chunk's MD5 is
         checked against what the server received, and the final size against the local file."""
         size = local.stat().st_size
         cs = self.chunk_size()
@@ -245,8 +297,8 @@ def cloud_candidates(library_root: Path, policy: str) -> list:
     return out
 
 
-def _uploaded(index: Index, rel: str, st) -> bool:
-    rec = index.cloud_of(rel)
+def _uploaded(index: Index, rel: str, st, root: str) -> bool:
+    rec = index.cloud_of(rel, root)
     return bool(rec) and rec[0] == st.st_size and abs(rec[1] - st.st_mtime) <= 2
 
 
@@ -254,9 +306,10 @@ def pending_cloud(library_root: Path, policy: str) -> int:
     candidates = cloud_candidates(library_root, policy)
     if not candidates:
         return 0
+    root = cloud_root()
     index = Index(Path(library_root), readonly=True)
     try:
-        return sum(1 for rel, st in candidates if not _uploaded(index, rel, st))
+        return sum(1 for rel, st in candidates if not _uploaded(index, rel, st, root))
     finally:
         index.close()
 
@@ -268,11 +321,12 @@ def upload_library(library_root: Path, client: Baidu, policy: str, progress: Opt
     candidates = cloud_candidates(library_root, policy)
     if not candidates:
         return res
+    root = client.root
     index = Index(library_root)
     try:
         todo = []
         for rel, st in candidates:
-            if _uploaded(index, rel, st):
+            if _uploaded(index, rel, st, root):
                 res.already += 1
             else:
                 todo.append((rel, st))
@@ -284,7 +338,7 @@ def upload_library(library_root: Path, client: Baidu, policy: str, progress: Opt
                 progress(i, len(todo), Path(rel).name)
             try:
                 info = client.upload(library_root / rel, rel)
-                index.mark_cloud(rel, st.st_size, st.st_mtime, str(info.get("fs_id", "")))
+                index.mark_cloud(rel, root, st.st_size, st.st_mtime, str(info.get("fs_id", "")))
                 index.commit()
                 res.uploaded += 1
             except BaiduAuthError:

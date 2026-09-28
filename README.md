@@ -82,7 +82,7 @@ Photoman can also upload to Baidu Netdisk through Baidu's official open platform
 2. Photoman menu → **Set Up Baidu Netdisk…** (or `photoman baidu-setup`), enter the three values
 3. A Baidu page opens; sign in and enter the code Photoman shows. Done
 
-Uploads then run in the background whenever the library drive is connected, and resume where they left off on any day. Files land in `我的应用数据/<app name>/` (`/apps/<app name>/`) with the same `YYYY/…` folders. Each chunk's MD5 is checked against what Baidu received. A re-exported edit replaces its older upload; nothing is deleted in the cloud. The menu and the Trips window show what's still waiting. Credentials are kept in `~/.photoman/baidu.json` (readable only by you).
+Uploads then run in the background whenever the library drive is connected, and resume where they left off on any day. Files land in `我的应用数据/<app name>/` (`/apps/<app name>/`) with the same `YYYY/…` folders. To upload somewhere else, set `"cloud_root"` in `~/.photoman/config.json`, e.g. `"/照片备份"` (the whole netdisk, `/`, isn't allowed); changing it uploads everything again to the new folder. Each chunk's MD5 is checked against what Baidu received. A re-exported edit replaces its older upload; nothing is deleted in the cloud. The menu and the Trips window show what's still waiting. Credentials are kept in `~/.photoman/baidu.json` (readable only by you).
 
 ## Lightroom Classic
 

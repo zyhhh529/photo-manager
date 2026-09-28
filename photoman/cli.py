@@ -116,7 +116,7 @@ def main(argv=None) -> int:
         if baidu.is_set_up():
             libs = [Path(p) for p in config.known_libraries(cfg) if Path(p).is_dir()]
             waiting = sum(baidu.pending_cloud(p, cfg["cloud_originals"]) for p in libs)
-            print(f"Baidu Netdisk: connected, uploads to /apps/{baidu.load_credentials()['app_name']} "
+            print(f"Baidu Netdisk: connected, uploads to {baidu.cloud_root()} "
                   f"({cfg['cloud_originals']} originals + edits; {waiting} files waiting)")
         else:
             print("Baidu Netdisk: not set up (run: photoman baidu-setup)")
@@ -170,7 +170,7 @@ def main(argv=None) -> int:
             while time.time() < deadline:
                 time.sleep(max(int(info.get("interval", 5)), 3))
                 if baidu.poll_device_auth(creds, info["device_code"]):
-                    print(f"✅ Connected. Uploads go to /apps/{creds['app_name']} in Baidu Netdisk.")
+                    print(f"✅ Connected. Uploads go to {baidu.cloud_root(creds)} in Baidu Netdisk.")
                     return 0
             print("Timed out waiting for authorization", file=sys.stderr)
         except baidu.BaiduError as e:

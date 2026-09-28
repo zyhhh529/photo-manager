@@ -111,8 +111,8 @@ def fill_status(trips: List[Trip], library_root: Path, backup_root: Optional[Pat
             if usable_backup:
                 backed = {sha: index.backup_of(sha, backup_root) for sha, _ in rows}
             if cloud_policy is not None:
-                clouded = dict(((r[0], (r[1], r[2])) for r in
-                                index.db.execute("SELECT rel_path, size, mtime FROM cloud")))
+                from .baidu import cloud_root
+                clouded = index.cloud_uploads(cloud_root())
         finally:
             index.close()
     for t in trips:

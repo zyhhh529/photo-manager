@@ -11,7 +11,7 @@ from pathlib import Path
 
 import pytest
 
-from photoman import baidu
+from photoman import baidu, config
 from photoman.importer import run_import
 
 
@@ -91,6 +91,7 @@ def server(monkeypatch, tmp_path):
     monkeypatch.setattr(baidu, "API", base + "/rest/2.0/xpan")
     monkeypatch.setattr(baidu, "PCS", base + "/rest/2.0/pcs")
     monkeypatch.setattr(baidu, "CRED_PATH", tmp_path / "home" / "baidu.json")
+    monkeypatch.setattr(config, "CONFIG_PATH", tmp_path / "home" / "config.json")  # never the real config
     monkeypatch.setattr(baidu, "CHUNK_BY_VIP", {0: 1024})   # small chunks so test files span several
     yield state
     httpd.shutdown()
@@ -187,3 +188,66 @@ def test_lost_authorization_stops_uploads(client, server, tmp_path):
     with pytest.raises(baidu.BaiduAuthError):
         baidu.upload_library(lib, client, "jpeg")
     assert baidu.pending_cloud(lib, "jpeg") == 1
+
+
+def test_only_upload_calls_are_allowed(client, server):
+    before = len(server["calls"])
+    for url, params, data in [
+        (baidu.API + "/file", {"method": "filemanager", "opera": "delete"}, {"filelist": '["/apps/Photoman/a.jpg"]'}),
+        (baidu.API + "/file", {"method": "list", "dir": "/"}, None),
+        (baidu.API + "/multimedia", {"method": "listall"}, None),
+        (baidu.PCS + "/file", {"method": "delete"}, None),
+    ]:
+        with pytest.raises(baidu.ForbiddenCall):
+            baidu._http(url, params, data)
+    assert len(server["calls"]) == before          # nothing reached the server
+
+
+def test_uploads_outside_the_app_folder_are_refused(client, server, tmp_path):
+    f = tmp_path / "a.jpg"
+    f.write_bytes(b"x")
+    for rel in ("../../我的资源/a.jpg", "x/../../../a.jpg"):
+        with pytest.raises(baidu.ForbiddenCall):
+            client.upload(f, rel)
+    client.creds["app_name"] = "Other"
+    with pytest.raises(baidu.ForbiddenCall):        # app name must match the saved one
+        client.upload(f, "a.jpg")
+    assert server["files"] == {}
+
+
+def _set_root(root):
+    cfg = config.load_config()
+    cfg["cloud_root"] = root
+    config.save_config(cfg)
+
+
+def test_custom_upload_folder(client, server, tmp_path):
+    _set_root("/照片备份")
+    f = tmp_path / "a.jpg"
+    f.write_bytes(b"x" * 10)
+    client.upload(f, "2026/2026-09-05_Rome/a.jpg")
+    assert list(server["files"]) == ["/照片备份/2026/2026-09-05_Rome/a.jpg"]
+    with pytest.raises(baidu.ForbiddenCall):       # the old app folder is now off limits too
+        baidu._http(baidu.API + "/file", {"method": "precreate"}, {"path": "/apps/Photoman/a.jpg"})
+
+
+def test_changing_the_upload_folder_uploads_again(client, server, tmp_path):
+    lib = tmp_path / "PhotoA"
+    lib.mkdir()
+    _file(tmp_path / "NIKON" / "DCIM" / "100" / "A.JPG", b"a")
+    run_import(tmp_path / "NIKON", lib, "", [".jpg"])
+    assert baidu.upload_library(lib, client, "jpeg").uploaded == 1
+    _set_root("/照片备份")
+    assert baidu.pending_cloud(lib, "jpeg") == 1
+    assert baidu.upload_library(lib, client, "jpeg").uploaded == 1
+    assert sorted(server["files"]) == ["/apps/Photoman/2026/2026-09-05/A.JPG", "/照片备份/2026/2026-09-05/A.JPG"]
+
+
+@pytest.mark.parametrize("root", ["/", "照片备份", "/照片备份/../我的资源"])
+def test_unsafe_upload_folders_are_refused(client, server, tmp_path, root):
+    _set_root(root)
+    f = tmp_path / "a.jpg"
+    f.write_bytes(b"x")
+    with pytest.raises(baidu.ForbiddenCall):
+        client.upload(f, "a.jpg")
+    assert server["files"] == {}

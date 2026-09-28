@@ -471,7 +471,8 @@ class PhotomanApp(rumps.App):
         fields = [("app_key", "AppKey", "The AppKey of the app you registered at pan.baidu.com/union"),
                   ("secret_key", "SecretKey", "The SecretKey of the same app"),
                   ("app_name", "App name", "The app's name exactly as registered. Uploads go to "
-                                            "“我的应用数据/<app name>” (/apps/<app name>) in Baidu Netdisk.")]
+                                            "“我的应用数据/<app name>” unless you set \"cloud_root\" "
+                                            "(e.g. /照片备份) in ~/.photoman/config.json.")]
         for key, label, help_text in fields:
             w = rumps.Window(title=f"Baidu Netdisk — {label}", message=help_text,
                              default_text=creds.get(key, ""), ok="Next", cancel="Cancel", dimensions=(320, 24))
