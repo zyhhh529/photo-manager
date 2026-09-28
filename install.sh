@@ -71,7 +71,13 @@ cat > "$PLIST" <<EOF
 </plist>
 EOF
 
+# Replace a running copy: bootout finishes asynchronously, and bootstrapping before it's gone fails
+# with "Bootstrap failed: 5: Input/output error".
 launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
+for _ in $(seq 1 20); do
+  launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1 || break
+  sleep 0.5
+done
 launchctl bootstrap "gui/$(id -u)" "$PLIST"
 
 echo
