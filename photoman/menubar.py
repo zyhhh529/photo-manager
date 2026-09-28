@@ -254,7 +254,7 @@ class PhotomanApp(rumps.App):
         if self.window is window:
             self.window = None
 
-    def begin_import(self, card: Path, lib: Path, trip: str) -> bool:
+    def begin_import(self, card: Path, lib: Path, trip: str, only=None) -> bool:
         """Called by the import window; runs the import on a background thread."""
         if self.backing_up:
             alert("A backup is running", "Photoman is copying earlier imports to the travel backup drive. "
@@ -273,7 +273,7 @@ class PhotomanApp(rumps.App):
                 res = run_import(card, lib, trip, self.cfg["extensions"],
                                  backup_root=Path(backup) if backup else None,
                                  progress=lambda i, n, name: callAfter(self.on_progress, i, n, name),
-                                 backup_policy=self.cfg["backup_originals"])
+                                 backup_policy=self.cfg["backup_originals"], only=only)
                 callAfter(self.on_import_done, card, res)
             except Exception as e:
                 traceback.print_exc()
@@ -320,11 +320,20 @@ class PhotomanApp(rumps.App):
                          + (" — it's backed up too." if res.backup_root else "."))
         bak = Path(res.backup_root) if res.backup_root else None
 
-        if res.failed or res.in_library < res.total:
+        if res.failed or res.in_library + res.not_selected < res.total:
             failed = [f for f in res.files if f.status == "failed"]
             lines.append("Failed:\n" + "\n".join(f"• {Path(f.source).name}: {f.error}" for f in failed[:5])
                          + (f"\n… and {len(failed) - 5} more" if len(failed) > 5 else ""))
             return "⚠️ Some files failed to import — do NOT format the card", "\n\n".join(lines), "error"
+        if res.not_selected:
+            lines.append(f"{res.not_selected} files on the card weren't selected and are only on the card. "
+                         f"Insert it again later to import them (what's already imported is skipped) "
+                         f"before formatting it.")
+            if res.backup_pending and res.backup_error:
+                lines.append(f"The travel backup drive is {res.backup_error}; the imported files will be "
+                             f"backed up when it's connected.")
+            return (f"Imported {res.in_library} of {res.total} files — keep the card",
+                    "\n\n".join(lines), "warn")
         if res.backup_pending:
             if res.backup_error == "not connected":
                 lines.append(f"The travel backup drive ({bak.name}) isn't connected. Connect it and Photoman "

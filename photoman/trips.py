@@ -7,6 +7,7 @@ any day, whether or not the app was running since. Trips on drives that aren't c
 from __future__ import annotations
 
 import json
+import sqlite3
 from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -14,7 +15,7 @@ from typing import List, Optional
 
 from . import config
 from .importer import (META_DIR, SETTLE_SECONDS, Index, backup_problem, edited_folder_for, files_in, raw_keys,
-                       same_file, wanted_in_cloud, wanted_on_drive)
+                       reconcile_library, same_file, wanted_in_cloud, wanted_on_drive)
 
 CACHE_PATH = config.HOME_DIR / "trips.json"
 
@@ -27,6 +28,7 @@ class Trip:
     edited_folder: Optional[str]       # relative to library_root
     imported_at: str                   # when the last import for this trip finished
     imports: int = 1
+    shas: List[str] = field(default_factory=list)   # content of the originals imported for this trip
     # live status (see fill_status)
     connected: bool = True
     photos: int = 0                    # imported originals still in the library
@@ -84,17 +86,19 @@ def trips_from_logs(library_root: Path) -> List[Trip]:
             continue  # nothing new was imported
         root = d.get("library_root") or str(library_root)  # paths in the log may predate a rename
         folders = [_rel(f, root) for f in d["folders"]]
+        shas = [f["sha"] for f in d.get("files", []) if f.get("sha")]
         edited = d.get("edited_folder")
         edited = _rel(edited, root) if edited else str(edited_folder_for(Path(sorted(folders)[0])))
         t = trips.get(edited)
         if t:
             t.folders = sorted(set(t.folders) | set(folders))
+            t.shas = sorted(set(t.shas) | set(shas))
             t.imports += 1
             t.imported_at = max(t.imported_at, d.get("finished_at", ""))
             t.name = t.name or d.get("trip", "")
         else:
             trips[edited] = Trip(library_root=str(library_root), name=d.get("trip", ""), folders=sorted(folders),
-                                 edited_folder=edited, imported_at=d.get("finished_at", ""))
+                                 edited_folder=edited, imported_at=d.get("finished_at", ""), shas=sorted(set(shas)))
     return list(trips.values())
 
 
@@ -116,8 +120,12 @@ def fill_status(trips: List[Trip], library_root: Path, backup_root: Optional[Pat
         finally:
             index.close()
     for t in trips:
-        prefixes = tuple(f.rstrip("/") + "/" for f in t.folders)
-        originals = [(sha, rel) for sha, rel in rows if rel.startswith(prefixes) and (library_root / rel).is_file()]
+        if t.shas:  # by content, so photos moved to other folders still count
+            members = set(t.shas)
+            originals = [(sha, rel) for sha, rel in rows if sha in members and (library_root / rel).is_file()]
+        else:       # logs from before content hashes were recorded
+            prefixes = tuple(f.rstrip("/") + "/" for f in t.folders)
+            originals = [(sha, rel) for sha, rel in rows if rel.startswith(prefixes) and (library_root / rel).is_file()]
         t.photos = len(originals)
         edited_dir = t.path(t.edited_folder) if t.edited_folder else None
         edits = list(files_in(edited_dir)) if edited_dir and edited_dir.is_dir() else []
@@ -167,6 +175,10 @@ def load_trips(libraries: List[str], backup_root: Optional[Path], policy: str = 
     out = []
     for lib in libraries:
         if Path(lib).is_dir():
+            try:
+                reconcile_library(Path(lib))  # follow photos moved or renamed since import
+            except (OSError, sqlite3.Error):
+                pass  # e.g. a read-only drive; counts may then miss moved photos
             trips = trips_from_logs(Path(lib))
             fill_status(trips, Path(lib), backup_root, policy, cloud_policy)
             cache[lib] = [asdict(t) for t in trips]

@@ -25,7 +25,7 @@ from pathlib import Path
 from typing import Callable, List, Optional
 
 from . import config
-from .importer import Index, ProgressCB, _library_files, edited_files, wanted_in_cloud
+from .importer import Index, ProgressCB, _library_files, edited_files, reconcile_library, wanted_in_cloud
 
 OAUTH = "https://openapi.baidu.com/oauth/2.0"
 API = "https://pan.baidu.com/rest/2.0/xpan"
@@ -304,12 +304,16 @@ def _uploaded(index: Index, rel: str, st, root: str) -> bool:
 
 def pending_cloud(library_root: Path, policy: str) -> int:
     candidates = cloud_candidates(library_root, policy)
-    if not candidates:
+    if not candidates and not (Path(library_root) / ".photoman" / "index.sqlite").exists():
         return 0
     root = cloud_root()
     index = Index(Path(library_root), readonly=True)
     try:
-        return sum(1 for rel, st in candidates if not _uploaded(index, rel, st, root))
+        n = sum(1 for rel, st in candidates if not _uploaded(index, rel, st, root))
+        # originals not at their recorded path (probably moved) and never uploaded: an upload run finds them
+        n += sum(1 for _sha, rel, exists in _library_files(index, Path(library_root))
+                 if not exists and wanted_in_cloud(rel, policy) and not index.cloud_of(rel, root))
+        return n
     finally:
         index.close()
 
@@ -318,6 +322,7 @@ def upload_library(library_root: Path, client: Baidu, policy: str, progress: Opt
                    should_stop: Optional[Callable[[], bool]] = None) -> CloudResult:
     library_root = Path(library_root)
     res = CloudResult(library_root=str(library_root))
+    reconcile_library(library_root)  # originals moved or renamed since import keep their upload record
     candidates = cloud_candidates(library_root, policy)
     if not candidates:
         return res

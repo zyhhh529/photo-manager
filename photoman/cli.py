@@ -11,12 +11,14 @@
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import sys
 import time
 from pathlib import Path
 
 from . import baidu, config
-from .importer import backup_library, backup_problem, is_camera_card, pending_backups, run_import
+from .importer import (backup_library, backup_problem, is_camera_card, pending_backups, run_import, scan_media,
+                       with_partners)
 
 
 def find_cards(volumes: Path = Path("/Volumes")) -> list:
@@ -56,8 +58,11 @@ def record_backup(library: Path, backup: Path) -> bool:
 def format_advice(res) -> str:
     if res.safe_to_format:
         return "✅ All files verified" + (" and backed up" if res.backup_root else "") + ", safe to format the card"
-    if res.failed or res.in_library < res.total:
+    if res.failed or res.in_library + res.not_selected < res.total:
         return "⚠️ Some files failed to import, do NOT format the card"
+    if res.not_selected:
+        return (f"⚠️ {res.not_selected} files weren't selected and are only on the card. Import them before "
+                f"formatting it.")
     if res.backup_error:
         return (f"⚠️ Imported, but the travel backup is {res.backup_error}. Keep the card until the photos are "
                 f"backed up (connect the drive and run: photoman backup)")
@@ -78,6 +83,9 @@ def main(argv=None) -> int:
     p_imp.add_argument("--trip", default="", help="trip name, e.g. Kyoto")
     p_imp.add_argument("--library", type=Path, help="import to this folder instead of the configured destination")
     p_imp.add_argument("--dry-run", action="store_true", help="simulate only, write nothing")
+    p_imp.add_argument("--only", action="append", metavar="PATTERN",
+                       help="import only files whose name matches, e.g. --only 'DSC_01*' (repeatable; "
+                            "RAW/JPEG partners are included)")
 
     sub.add_parser("cards", help="list inserted camera cards")
     sub.add_parser("status", help="show config and last import")
@@ -200,10 +208,16 @@ def main(argv=None) -> int:
         print("No import destination set. Pass --library <path> or run: python -m photoman.cli set-library <path>", file=sys.stderr)
         return 2
     backup = Path(cfg["travel_backup_root"]) if cfg.get("travel_backup_root") else None
+    only = None
+    if args.only:
+        card_files = scan_media(args.source, cfg["extensions"])
+        picked = [f for f in card_files if any(fnmatch.fnmatch(f.name.lower(), p.lower()) for p in args.only)]
+        only = with_partners(picked, card_files)
+        print(f"{len(only)} of {len(card_files)} files selected")
     try:
         res = run_import(args.source, library, args.trip, cfg["extensions"],
                          dry_run=args.dry_run, backup_root=backup, progress=_progress,
-                         backup_policy=cfg["backup_originals"])
+                         backup_policy=cfg["backup_originals"], only=only)
     except (FileNotFoundError, PermissionError) as e:
         print(e, file=sys.stderr)
         return 2

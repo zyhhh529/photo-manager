@@ -413,3 +413,96 @@ def test_raw_policy_catch_up_skips_paired_jpegs(pair_card, library, tmp_path):
     assert (r.copied, r.skipped) == (3, 1)
     res = run_import(card, library, "Europe", EXTS, backup_root=backup, backup_policy="raw")
     assert res.safe_to_format
+
+
+# ---------------------------------------------------------------- partial imports
+
+def test_partial_import_leaves_the_rest_on_the_card(pair_card, library):
+    files = scan_media(pair_card, EXTS)
+    first = [f for f in files if f.name == "DSC_0001.JPG"]
+    chosen = importer.with_partners(first, files)            # the NEF partner comes along
+    assert sorted(Path(p).name for p in chosen) == ["DSC_0001.JPG", "DSC_0001.NEF"]
+    res = run_import(pair_card, library, "Rome", EXTS, only=chosen)
+    assert (res.copied, res.not_selected) == (2, 2)
+    assert not res.safe_to_format                             # two files are only on the card
+    assert "2 not selected" in res.summary()
+    assert sorted(p.name for p in library.rglob("DSC_*")) == ["DSC_0001.JPG", "DSC_0001.NEF"]
+
+    # next time: import the rest; the first two are recognized as already imported
+    rest = run_import(pair_card, library, "Rome", EXTS)
+    assert (rest.copied, rest.already_imported, rest.not_selected) == (2, 2, 0)
+    assert rest.safe_to_format
+    assert rest.edited_folder == res.edited_folder            # still one trip
+
+
+def test_selecting_nothing_new_imports_nothing(pair_card, library):
+    res = run_import(pair_card, library, "Rome", EXTS, only=[])
+    assert res.copied == 0 and res.not_selected == 4 and list(library.rglob("DSC_*")) == []
+
+
+# ---------------------------------------------------------------- reorganizing the library after import
+
+def _move(library, name, new_rel):
+    src = next(library.rglob(name))
+    dst = library / new_rel
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    src.rename(dst)
+    return dst
+
+
+def test_moved_and_renamed_files_are_not_imported_again(pair_card, library):
+    run_import(pair_card, library, "Rome", EXTS)
+    _move(library, "DSC_0001.NEF", "2026/2026-09-05_Rome/Colosseum/DSC_0001.NEF")
+    _move(library, "DSC_0002.JPG", "Favorites/Rome sunset.jpg")
+    res = run_import(pair_card, library, "Rome", EXTS)
+    assert (res.copied, res.already_imported) == (0, 4) and res.safe_to_format
+    assert not (library / "2026/2026-09-05_Rome/DSC_0001.NEF").exists()   # no duplicate re-imported
+    index = importer.Index(library)
+    rels = sorted(rel for _, rel in index.all_files())
+    index.close()
+    assert "2026/2026-09-05_Rome/Colosseum/DSC_0001.NEF" in rels and "Favorites/Rome sunset.jpg" in rels
+
+
+def test_moved_before_backup_is_still_backed_up_once(pair_card, library, tmp_path):
+    backup = tmp_path / "TravelSSD"
+    run_import(pair_card, library, "Rome", EXTS, backup_root=backup)   # backup drive not connected
+    _move(library, "DSC_0001.NEF", "2026/2026-09-05_Rome/Colosseum/DSC_0001.NEF")
+    backup.mkdir()
+    assert importer.pending_backups(library, backup) == 4             # the moved one is not forgotten
+    r = importer.backup_library(library, backup)
+    assert (r.copied, r.moved, r.failed) == (4, 1, 0)
+    assert (backup / "2026/2026-09-05_Rome/Colosseum/DSC_0001.NEF").is_file()
+    assert importer.pending_backups(library, backup) == 0
+
+
+def test_moved_after_backup_is_not_copied_again(pair_card, library, tmp_path):
+    backup = tmp_path / "TravelSSD"
+    backup.mkdir()
+    run_import(pair_card, library, "Rome", EXTS, backup_root=backup)
+    _move(library, "DSC_0001.NEF", "2026/2026-09-05_Rome/Colosseum/DSC_0001.NEF")
+    r = importer.backup_library(library, backup)
+    assert (r.copied, r.already, r.moved) == (0, 4, 1)
+    assert (backup / "2026/2026-09-05_Rome/DSC_0001.NEF").is_file()   # backup keeps the import-time layout
+    assert not (backup / "2026/2026-09-05_Rome/Colosseum").exists()
+
+
+def test_deleted_files_are_marked_gone_once(pair_card, library, tmp_path):
+    backup = tmp_path / "TravelSSD"
+    backup.mkdir()
+    run_import(pair_card, library, "Rome", EXTS, backup_root=backup)
+    next(library.rglob("DSC_0002.JPG")).unlink()
+    r = importer.backup_library(library, backup)
+    assert r.missing == 1 and importer.pending_backups(library, backup) == 0
+    assert importer.backup_library(library, backup).missing == 0      # not searched for again
+
+
+def test_edited_folder_moved_into_a_subfolder_is_still_backed_up(pair_card, library, tmp_path):
+    backup = tmp_path / "TravelSSD"
+    backup.mkdir()
+    res = run_import(pair_card, library, "Rome", EXTS, backup_root=backup)
+    moved = library / "2026" / "Italy" / Path(res.edited_folder).name
+    moved.parent.mkdir()
+    Path(res.edited_folder).rename(moved)
+    _export(moved / "best.jpg", b"edit")
+    assert importer.backup_library(library, backup).edited_copied == 1
+    assert (backup / "2026/Italy/2026-09-05_Rome_Edited/best.jpg").is_file()

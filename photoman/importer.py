@@ -23,7 +23,7 @@ import time
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
-from typing import Callable, Dict, Iterable, List, Optional
+from typing import Callable, Dict, Iterable, List, Optional, Tuple
 
 CHUNK = 4 * 1024 * 1024
 META_DIR = ".photoman"
@@ -239,6 +239,9 @@ class Index:
                    imported_at TEXT NOT NULL)"""
         )
         self.db.execute("CREATE INDEX IF NOT EXISTS sig ON files(orig_name, size, captured_at)")
+        # gone = 1: deleted from the library (not just moved; see reconcile). Added after the first release.
+        if "gone" not in {r[1] for r in self.db.execute("PRAGMA table_info(files)")}:
+            self.db.execute("ALTER TABLE files ADD COLUMN gone INTEGER NOT NULL DEFAULT 0")
         self.db.execute(
             """CREATE TABLE IF NOT EXISTS backups (
                    sha256 TEXT NOT NULL,
@@ -271,12 +274,23 @@ class Index:
 
     def add(self, sha: str, rel_path: str, size: int, name: str, captured: datetime) -> None:
         self.db.execute(
-            "INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?)",  # replaces rows whose file was deleted
+            "INSERT OR REPLACE INTO files (sha256, rel_path, size, orig_name, captured_at, imported_at) "
+            "VALUES (?,?,?,?,?,?)",  # replaces rows whose file was deleted
             (sha, rel_path, size, name, captured.isoformat(), datetime.now().isoformat(timespec="seconds")),
         )
 
     def all_files(self) -> List[tuple]:
-        return self.db.execute("SELECT sha256, rel_path FROM files ORDER BY rel_path").fetchall()
+        """(sha, rel_path) of imported files, except ones deleted from the library."""
+        return self.db.execute("SELECT sha256, rel_path FROM files WHERE gone=0 ORDER BY rel_path").fetchall()
+
+    def relink(self, sha: str, old_rel: str, new_rel: str) -> None:
+        """The file was moved or renamed inside the library. Cloud upload records move along, so it isn't
+        uploaded again (the cloud copy stays where it was uploaded)."""
+        self.db.execute("UPDATE files SET rel_path=?, gone=0 WHERE sha256=?", (new_rel, sha))
+        self.db.execute("UPDATE OR REPLACE cloud_uploads SET rel_path=? WHERE rel_path=?", (new_rel, old_rel))
+
+    def mark_gone(self, sha: str) -> None:
+        self.db.execute("UPDATE files SET gone=1 WHERE sha256=?", (sha,))
 
     def backup_of(self, sha: str, backup_root: Path) -> Optional[str]:
         row = self.db.execute("SELECT rel_path FROM backups WHERE sha256=? AND backup_root=?",
@@ -313,8 +327,9 @@ class Index:
 @dataclass
 class FileResult:
     source: str
-    status: str  # copied / already_imported / duplicate / failed / would_copy
+    status: str  # copied / already_imported / duplicate / failed / would_copy / not_selected
     dest: Optional[str] = None
+    sha: Optional[str] = None
     error: Optional[str] = None
     backup_ok: Optional[bool] = None
 
@@ -333,6 +348,7 @@ class ImportResult:
     duplicate: int = 0
     failed: int = 0
     would_copy: int = 0
+    not_selected: int = 0               # left on the card by a partial import
     bytes_copied: int = 0
     backup_root: Optional[str] = None    # configured travel backup, whether or not it's connected
     backup_error: Optional[str] = None   # why the backup couldn't run ("not connected", "read-only")
@@ -366,6 +382,8 @@ class ImportResult:
                     f"{self.already_imported} already imported")
         s = (f"{self.total} files: {self.copied} imported, {self.already_imported} already imported, "
              f"{self.duplicate} duplicates, {self.failed} failed")
+        if self.not_selected:
+            s += f", {self.not_selected} not selected"
         if self.backup_root and self.backup_error:
             s += f"; travel backup {self.backup_error}"
         elif self.backup_root:
@@ -431,6 +449,66 @@ def ensure_backed_up(index: Index, library_root: Path, backup_root: Path, sha: s
         return False
 
 
+def with_partners(selected: Iterable, card_files: Iterable) -> set:
+    """Selected card files plus their RAW/JPEG partners (same folder and name), so pairs stay together."""
+    keys = {(str(Path(p).parent), Path(p).stem.lower()) for p in selected}
+    return {str(p) for p in card_files if (str(Path(p).parent), Path(p).stem.lower()) in keys} | {str(p) for p in selected}
+
+
+def reconcile(index: Index, library_root: Path) -> Tuple[int, int]:
+    """Find imported files that are no longer at their recorded path: moved or renamed ones are found again by
+    size and SHA-256 and relinked; the rest are marked gone (deleted from the library). Returns (moved, gone)."""
+    library_root = Path(library_root)
+    rows = index.db.execute("SELECT sha256, rel_path, size, gone FROM files").fetchall()
+    missing = {sha: rel for sha, rel, size, gone in rows if not (library_root / rel).is_file()}
+    for sha, rel, size, gone in rows:  # a "gone" file that is back where it was
+        if gone and sha not in missing:
+            index.db.execute("UPDATE files SET gone=0 WHERE sha256=?", (sha,))
+    if not missing:
+        index.commit()
+        return 0, 0
+    sizes = {size for sha, rel, size, gone in rows if sha in missing}
+    known = {rel for sha, rel, size, gone in rows if sha not in missing}
+    moved = 0
+    for dirpath, dirnames, filenames in os.walk(library_root):
+        dirnames[:] = [d for d in dirnames if not d.startswith(".")]
+        for name in filenames:
+            if name.startswith(".") or name.endswith(".part"):
+                continue
+            path = Path(dirpath) / name
+            rel = str(path.relative_to(library_root))
+            try:
+                if rel in known or path.stat().st_size not in sizes:
+                    continue
+                sha = sha256_file(path)
+            except OSError:
+                continue
+            if sha in missing:
+                index.relink(sha, missing.pop(sha), rel)
+                known.add(rel)
+                moved += 1
+        if not missing:
+            break
+    for sha in missing:
+        index.mark_gone(sha)
+    index.commit()
+    return moved, len(missing)
+
+
+def reconcile_library(library_root: Path) -> Tuple[int, int]:
+    """reconcile() if any imported file isn't where the index says (cheap check first)."""
+    library_root = Path(library_root)
+    if not (library_root / META_DIR / "index.sqlite").exists():
+        return 0, 0
+    index = Index(library_root)
+    try:
+        if all((library_root / rel).is_file() for _, rel in index.all_files()):
+            return 0, 0
+        return reconcile(index, library_root)
+    finally:
+        index.close()
+
+
 def run_import(
     source: Path,
     library_root: Path,
@@ -440,7 +518,10 @@ def run_import(
     backup_root: Optional[Path] = None,
     progress: Optional[ProgressCB] = None,
     backup_policy: str = "all",
+    only: Optional[Iterable] = None,
 ) -> ImportResult:
+    """Import `source` into `library_root`. With `only`, just those card files are copied; the rest are
+    checked (already imported?) but left on the card, so the card isn't reported safe to format."""
     source, library_root = Path(source), Path(library_root)
     trip = sanitize_trip(trip)
     res = ImportResult(
@@ -463,6 +544,19 @@ def run_import(
     index = Index(library_root, readonly=dry_run)
     folders = set()
     card_raws = raw_keys(files)
+    selected = None if only is None else {str(Path(p)) for p in only}
+    reconciled = False
+
+    def in_library(rel: Optional[str]) -> bool:
+        """Is the indexed file still there? If not, it may have been moved or renamed: look for it by content
+        once per import, so reorganizing the library doesn't make a card import everything again."""
+        nonlocal reconciled
+        if rel and (library_root / rel).is_file():
+            return True
+        if rel and not reconciled and not dry_run:
+            reconciled = True
+            reconcile(index, library_root)
+        return False
 
     def back_up(fr: FileResult, sha: str, rel: str) -> None:
         if not dry_run and backup_root is not None and not wanted_on_drive(fr.source, card_raws, backup_policy):
@@ -487,12 +581,19 @@ def run_import(
                 # 1) Fast check: same name, size and capture time → confirm with the hash.
                 #    Only counts if the file is still in the library (it may have been deleted since).
                 sig = index.by_signature(src.name, size, captured)
+                if sig and not in_library(sig[1]):
+                    sig = index.by_signature(src.name, size, captured)  # found where it was moved to?
                 if sig and (library_root / sig[1]).is_file():
                     if dry_run or sha256_file(src) == sig[0]:
-                        fr.status, fr.dest = "already_imported", sig[1]
+                        fr.status, fr.dest, fr.sha = "already_imported", sig[1], sig[0]
                         res.already_imported += 1
                         back_up(fr, sig[0], sig[1])  # e.g. imported while the backup drive wasn't connected
                         continue
+
+                if selected is not None and str(src) not in selected:
+                    fr.status = "not_selected"  # stays on the card; a later import can pick it up
+                    res.not_selected += 1
+                    continue
 
                 folder = dest_folder(library_root, captured, trip)
                 if dry_run:
@@ -508,9 +609,11 @@ def run_import(
 
                 # 3) Content identical to a file already in the library (e.g. renamed) → don't store a second copy
                 existing = index.by_hash(sha)
+                if existing and not in_library(existing):
+                    existing = index.by_hash(sha)
                 if existing and (library_root / existing).is_file():
                     tmp.unlink()
-                    fr.status, fr.dest = "duplicate", existing
+                    fr.status, fr.dest, fr.sha = "duplicate", existing, sha
                     res.duplicate += 1
                     back_up(fr, sha, existing)
                     continue
@@ -524,7 +627,7 @@ def run_import(
                 rel = str(dest.relative_to(library_root))
                 index.add(sha, rel, size, src.name, captured)
                 index.commit()
-                fr.status, fr.dest = "copied", rel
+                fr.status, fr.dest, fr.sha = "copied", rel, sha
                 res.copied += 1
                 res.bytes_copied += size
                 folders.add(str(folder))
@@ -569,7 +672,8 @@ class BackupResult:
     copied: int = 0            # newly backed up
     already: int = 0           # had a verified copy already
     failed: int = 0
-    missing: int = 0           # deleted from the library since import (their backups are kept)
+    missing: int = 0           # found deleted from the library in this run (their backups are kept)
+    moved: int = 0             # found moved or renamed inside the library (their backups stay put)
     skipped: int = 0           # not wanted on the backup drive (JPEGs with a RAW twin)
     edited_copied: int = 0     # new or re-exported files from *_Edited folders
     edited_already: int = 0
@@ -577,6 +681,8 @@ class BackupResult:
 
     def summary(self) -> str:
         s = f"{self.copied} originals backed up, {self.already} already backed up, {self.failed} failed"
+        if self.moved:
+            s += f", {self.moved} moved in the library"
         if self.missing:
             s += f", {self.missing} no longer in the library"
         s += f"; edited: {self.edited_copied} backed up, {self.edited_already} already backed up"
@@ -594,7 +700,13 @@ class BackupResult:
 
 
 def edited_folders(library_root: Path) -> List[Path]:
-    return sorted(p for p in Path(library_root).glob(f"*/*{EDITED_SUFFIX}") if p.is_dir())
+    """*_Edited folders up to three levels below the year folders (so they can be moved into subfolders);
+    an Edited folder nested inside another counts once, as part of the outer one."""
+    found = set()
+    for depth in range(1, 4):
+        found |= {p for p in Path(library_root).glob("*/" * depth + f"*{EDITED_SUFFIX}")
+                  if p.is_dir() and not any(part.startswith(".") for part in p.relative_to(library_root).parts)}
+    return sorted(p for p in found if not any(a in found for a in p.parents))
 
 
 def edited_files(library_root: Path, settle: float = SETTLE_SECONDS):
@@ -659,11 +771,12 @@ def pending_backups(library_root: Path, backup_root: Path, include_edited: bool 
         index = Index(library_root, readonly=True)
         try:
             rows = list(_library_files(index, library_root))
-            keys = raw_keys(rel for _, rel, exists in rows if exists)
+            keys = raw_keys(rel for _, rel, exists in rows)
             for sha, rel, exists in rows:
-                if not exists or not wanted_on_drive(rel, keys, policy):
+                if not wanted_on_drive(rel, keys, policy):
                     continue
                 done = index.backup_of(sha, backup_root)
+                # not at its recorded path and not backed up: probably moved; a backup run will find it
                 if not (done and (backup_root / done).is_file()):
                     n += 1
         finally:
@@ -688,6 +801,9 @@ def backup_library(library_root: Path, backup_root: Path, progress: Optional[Pro
     res = BackupResult(library_root=str(library_root), backup_root=str(backup_root))
     index = Index(library_root)
     try:
+        if not all(exists for _, _, exists in _library_files(index, library_root)):
+            # files moved or renamed since import are found again by content; deleted ones are counted here
+            res.moved, res.missing = reconcile(index, library_root)
         rows = list(_library_files(index, library_root))
         keys = raw_keys(rel for _, rel, exists in rows if exists)
         edited = list(edited_files(library_root))

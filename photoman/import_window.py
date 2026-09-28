@@ -1,4 +1,4 @@
-"""The import window: card info, destination, trip name → progress → result, all in one window.
+"""The import window: card info, which photos, destination, trip name → progress → result, all in one window.
 
 Driven by the menu bar app (menubar.py), which owns the import thread; this module is only the UI.
 """
@@ -11,12 +11,12 @@ from typing import List
 import objc
 from AppKit import (
     NSBackingStoreBuffered, NSButton, NSColor, NSFloatingWindowLevel, NSFont, NSLayoutAttributeLeading,
-    NSMenuItem, NSPopUpButton, NSProgressIndicator, NSStackView, NSTextField, NSView, NSWindow,
+    NSMenuItem, NSOpenPanel, NSPopUpButton, NSProgressIndicator, NSStackView, NSTextField, NSView, NSWindow,
     NSWindowStyleMaskClosable, NSWindowStyleMaskTitled,
 )
-from Foundation import NSMakeRect, NSObject
+from Foundation import NSURL, NSMakeRect, NSObject
 
-from .importer import dest_folder, sanitize_trip
+from .importer import dest_folder, sanitize_trip, with_partners
 from .macui import activate_app, alert, check_destination, choose_folder, drive_label, free_space, human_size
 
 WIDTH = 460
@@ -75,14 +75,38 @@ class ImportWindow(NSObject):
     def setup(self, app, card: Path, files: List[Path], dates: List[datetime], destinations: List[str],
               current: Path, trip: str):
         self.app, self.card, self.files, self.dates = app, card, files, dates
-        self.size = sum(f.stat().st_size for f in files)
+        self.sizes = {str(f): f.stat().st_size for f in files}
+        self.date_of = {str(f): d for f, d in zip(files, dates)}
+        self.selected = None        # None: everything on the card; otherwise the chosen card files (as str)
+        self.scope_index = 0
         self.state = "ready"
         self.extra_destinations = []  # chosen in this window, not yet remembered
 
         # --- header
         self.title_label = _label(f"Import from “{card.name}”", size=16, bold=True)
-        info = f"{len(files)} files · {human_size(self.size)} · shot {date_range_label(dates)}"
+        info = f"{len(files)} files · {human_size(sum(self.sizes.values()))} · shot {date_range_label(dates)}"
         self.info_label = _fixed_width(_label(info, color=NSColor.secondaryLabelColor(), wrap=True))
+
+        # --- which photos
+        self.scope_popup = _fixed_width(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, WIDTH, 26), False))
+        for title in (f"All {len(files)} files", "Only some days…", "Choose photos…"):
+            self.scope_popup.addItemWithTitle_(title)
+        self.scope_popup.setTarget_(self)
+        self.scope_popup.setAction_("scopeChanged:")
+        by_day = {}
+        for f, d in zip(files, dates):
+            by_day.setdefault(d.date(), []).append(str(f))
+        self.day_checks = []
+        for day, day_files in sorted(by_day.items()):
+            size = sum(self.sizes[f] for f in day_files)
+            cb = NSButton.checkboxWithTitle_target_action_(
+                f"{day:%a}, {day:%b} {day.day} · {len(day_files)} files · {human_size(size)}", self, "dayToggled:")
+            cb.setState_(1)
+            self.day_checks.append((cb, day_files))
+        self.days_box = _vstack([cb for cb, _ in self.day_checks], spacing=4)
+        self.days_box.setHidden_(True)
+        self.selection_label = _fixed_width(_label(wrap=True, size=12, color=NSColor.secondaryLabelColor()))
+        self.selection_label.setHidden_(True)
 
         # --- form
         self.dest_popup = _fixed_width(NSPopUpButton.alloc().initWithFrame_pullsDown_(NSMakeRect(0, 0, WIDTH, 26), False))
@@ -96,10 +120,12 @@ class ImportWindow(NSObject):
         self.trip_field.setDelegate_(self)
         self.preview_label = _fixed_width(_label(wrap=True, size=11, color=NSColor.secondaryLabelColor()))
         self.form = _vstack([
+            _label("Photos", bold=True), self.scope_popup, self.days_box, self.selection_label,
             _label("Import to", bold=True), self.dest_popup, self.dest_warning, self.backup_label,
             _label("Trip name", bold=True), self.trip_field, self.preview_label,
         ])
-        self.form.setCustomSpacing_afterView_(14, self.dest_popup)
+        for v in (self.scope_popup, self.days_box, self.selection_label, self.dest_popup):
+            self.form.setCustomSpacing_afterView_(14, v)
         self.form.setCustomSpacing_afterView_(14, self.dest_warning)
         self.form.setCustomSpacing_afterView_(14, self.backup_label)
 
@@ -193,6 +219,79 @@ class ImportWindow(NSObject):
     def windowWillClose_(self, _notification):
         self.app.import_window_closed(self)
 
+    # ------------------------------------------------------------ which photos
+
+    @objc.python_method
+    def chosen(self) -> List[str]:
+        return [str(f) for f in self.files] if self.selected is None else sorted(self.selected)
+
+    @objc.python_method
+    def chosen_size(self) -> int:
+        return sum(self.sizes[f] for f in self.chosen())
+
+    def scopeChanged_(self, _sender):
+        i = self.scope_popup.indexOfSelectedItem()
+        if i == 0:
+            self.selected = None
+        elif i == 1:
+            self.selected = {f for cb, day_files in self.day_checks if cb.state() for f in day_files}
+        else:
+            picked = self.pick_photos()
+            if picked is None:  # cancelled: keep what was selected before
+                self.scope_popup.selectItemAtIndex_(self.scope_index)
+                return
+            self.selected = picked
+        self.scope_index = i
+        self.days_box.setHidden_(i != 1)
+        self.update_selection()
+
+    def dayToggled_(self, _sender):
+        self.selected = {f for cb, day_files in self.day_checks if cb.state() for f in day_files}
+        self.update_selection()
+
+    @objc.python_method
+    def pick_photos(self):
+        """Finder-style picker on the card (⌘/Shift-click for several, Space to preview). RAW/JPEG partners of
+        picked files are added, so pairs stay together."""
+        panel = NSOpenPanel.openPanel()
+        panel.setCanChooseFiles_(True)
+        panel.setCanChooseDirectories_(False)
+        panel.setAllowsMultipleSelection_(True)
+        start = self.card / "DCIM" if (self.card / "DCIM").is_dir() else self.card
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(str(start)))
+        panel.setMessage_("Select the photos to import — ⌘-click or Shift-click for several, Space to preview. "
+                          "The RAW/JPEG partner of each photo is included automatically.")
+        panel.setPrompt_("Select")
+        activate_app()
+        if panel.runModal() != 1:
+            return None
+        on_card = {str(f) for f in self.files}
+        picked = {str(Path(u.path())) for u in panel.URLs()} & on_card  # ignore anything that isn't a card photo
+        return with_partners(picked, self.files)
+
+    @objc.python_method
+    def update_selection(self):
+        n, total = len(self.chosen()), len(self.files)
+        if self.selected is None:
+            self.selection_label.setHidden_(True)
+            self.import_button.setTitle_("Import")
+        else:
+            if n:
+                text = f"{n} of {total} files selected · {human_size(self.chosen_size())}."
+                if n < total:
+                    text += " The rest stay on the card — import them later before formatting it."
+                if self.scope_index == 2:
+                    text += " RAW/JPEG partners included."
+                color = NSColor.secondaryLabelColor()
+            else:
+                text, color = "Nothing selected.", NSColor.systemOrangeColor()
+            self.selection_label.setStringValue_(text)
+            self.selection_label.setTextColor_(color)
+            self.selection_label.setHidden_(False)
+            self.import_button.setTitle_(f"Import {n}" if n else "Import")
+        self.validate()
+        self.update_preview()
+
     # ------------------------------------------------------------ destination
 
     @objc.python_method
@@ -243,14 +342,15 @@ class ImportWindow(NSObject):
         lib = self.selected_destination()
         problem = "Choose where to import the photos." if lib is None else check_destination(lib, self.card)
         warning, color = problem, NSColor.systemRedColor()
-        if not problem and self.size > free_space(lib):
-            warning, color = (f"Only {human_size(free_space(lib))} free on {drive_label(lib)}, and the card has "
-                              f"{human_size(self.size)}. Files imported before are skipped, so it may still fit."
+        size = self.chosen_size()
+        if not problem and size > free_space(lib):
+            warning, color = (f"Only {human_size(free_space(lib))} free on {drive_label(lib)}, and the selected "
+                              f"files take {human_size(size)}. Files imported before are skipped, so it may still fit."
                               ), NSColor.systemOrangeColor()
         self.dest_warning.setStringValue_(warning)
         self.dest_warning.setTextColor_(color)
         self.dest_warning.setHidden_(not warning)
-        self.import_button.setEnabled_(not problem)
+        self.import_button.setEnabled_(not problem and bool(self.chosen()))
         self.update_backup_label()
         self.fit()
         return not problem
@@ -277,9 +377,14 @@ class ImportWindow(NSObject):
         if lib is None:
             self.preview_label.setHidden_(True)
             return
+        dates = [self.date_of[f] for f in self.chosen()]
+        if not dates:
+            self.preview_label.setHidden_(True)
+            self.fit()
+            return
         trip = sanitize_trip(self.trip_field.stringValue())
-        days = sorted({d.date() for d in self.dates})
-        first = dest_folder(lib, min(self.dates), trip)
+        days = sorted({d.date() for d in dates})
+        first = dest_folder(lib, min(dates), trip)
         more = f"  (+{len(days) - 1} more date folder{'s' if len(days) > 2 else ''})" if len(days) > 1 else ""
         self.preview_label.setStringValue_(f"→ {first}{more}")
         self.preview_label.setHidden_(False)
@@ -291,11 +396,12 @@ class ImportWindow(NSObject):
         lib = self.selected_destination()
         if not self.validate():
             return
-        if self.size > free_space(lib) and alert(
+        if self.chosen_size() > free_space(lib) and alert(
                 "Destination may be too full", self.dest_warning.stringValue(),
                 ok="Import Anyway", cancel="Cancel") != 1:
             return
-        if not self.app.begin_import(self.card, lib, self.trip_field.stringValue().strip()):
+        only = None if self.selected is None else sorted(self.selected)
+        if not self.app.begin_import(self.card, lib, self.trip_field.stringValue().strip(), only):
             return
         self.state = "running"
         self.form.setHidden_(True)
@@ -303,7 +409,8 @@ class ImportWindow(NSObject):
         self.cancel_button.setHidden_(True)
         self.import_button.setEnabled_(False)
         self.import_button.setTitle_("Importing…")
-        self.info_label.setStringValue_(f"Importing to {lib.name} on {drive_label(lib)}")
+        what = "" if self.selected is None else f"{len(self.selected)} selected files "
+        self.info_label.setStringValue_(f"Importing {what}to {lib.name} on {drive_label(lib)}")
         self.show_progress(0, len(self.files), "")
         self.fit()
 

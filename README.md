@@ -21,6 +21,7 @@ Photos go wherever you choose, typically a folder on an external drive where you
 - When a card is inserted, the import window shows the card (files, size, dates), a destination menu with free space, and a trip name field with a preview of the folders that will be created
 - Pick a recent destination or **Choose Other Folder…**; read-only drives (e.g. NTFS) and the card itself are refused
 - The last destination is remembered; if its drive isn't connected, the most recently used connected one is suggested
+- **Photos**: import everything, **only some days** (tick the shooting days), or **Choose photos…** (a Finder-style picker on the card: ⌘/Shift-click, Space to preview). The RAW/JPEG partner of a chosen photo always comes along. Files left out stay on the card, so it isn't reported safe to format; insert it again later to import the rest (what's already imported is skipped)
 - Progress and the result (safe to format or not, with Eject Card / Show in Finder) appear in the same window
 - **Import Destination ▸** in the menu lists recent destinations (✓ = current) and lets you switch or choose a new folder
 - If the card is larger than the free space, you're warned before importing
@@ -40,6 +41,17 @@ Each destination keeps its own index, so duplicate detection works within a dest
 - Each file is first written as a `.part` temp file, re-read and checked against its SHA-256, and only then renamed to its final name
 - **The card is read-only**: files on it are never modified or deleted; format the card manually in the camera
 - If a travel backup drive is set, see [Travel backup](#travel-backup) below
+
+## Reorganizing after import
+
+You can move, rename and sort imported photos into subfolders (or other folders in the destination) whenever you like, even while a backup is running:
+
+- Photoman tracks originals by content (SHA-256), not by path. When a photo isn't where it was imported, it's found again by size and hash and its record is updated
+- Re-inserting the card doesn't import moved or renamed photos again
+- A photo moved before it was backed up / uploaded is still backed up (at its new place); one moved afterwards isn't copied again: the backup drive and Baidu Netdisk keep the layout from when each file was first copied, and nothing there is moved or deleted
+- Photos you delete are noted once and not searched for again; their backup copies stay
+- Trips keep counting their photos wherever they've been moved (for imports made with this version or later)
+- `_Edited` folders can be moved up to three levels deep inside a year folder and are still backed up
 
 ## Edited folder (Lightroom exports)
 
@@ -95,6 +107,7 @@ After importing, in LrC choose File → Import, select the matching date folders
 ~/.photoman/photoman cards
 ~/.photoman/photoman import /Volumes/NIKON_Z --trip Rome --dry-run   # simulate first
 ~/.photoman/photoman import /Volumes/NIKON_Z --trip Rome
+~/.photoman/photoman import /Volumes/NIKON_Z --trip Rome --only 'DSC_01*'                  # only some files
 ~/.photoman/photoman import /Volumes/NIKON_Z --trip Rome --library /Volumes/PhotoB/Photos   # one-off destination
 ~/.photoman/photoman set-library /Volumes/PhotoA/Photos                                    # change the default
 ~/.photoman/photoman set-backup /Volumes/TravelSSD/Photos                                  # travel backup (none = off)

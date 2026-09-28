@@ -251,3 +251,30 @@ def test_unsafe_upload_folders_are_refused(client, server, tmp_path, root):
     with pytest.raises(baidu.ForbiddenCall):
         client.upload(f, "a.jpg")
     assert server["files"] == {}
+
+
+def test_moved_originals_are_not_uploaded_twice(client, server, tmp_path):
+    lib = tmp_path / "PhotoA"
+    lib.mkdir()
+    _file(tmp_path / "NIKON" / "DCIM" / "100" / "A.JPG", b"a" * 50)
+    _file(tmp_path / "NIKON" / "DCIM" / "100" / "B.JPG", b"b" * 60)
+    run_import(tmp_path / "NIKON", lib, "Rome", [".jpg"])
+    day = lib / "2026" / "2026-09-05_Rome"
+    assert baidu.upload_library(lib, client, "jpeg").uploaded == 2
+    (day / "Best").mkdir()
+    (day / "A.JPG").rename(day / "Best" / "A.JPG")                 # moved after upload
+    assert baidu.pending_cloud(lib, "jpeg") == 0
+    assert baidu.upload_library(lib, client, "jpeg").uploaded == 0
+    assert len(server["files"]) == 2                               # cloud keeps its original layout
+
+
+def test_originals_moved_before_upload_are_found(client, server, tmp_path):
+    lib = tmp_path / "PhotoA"
+    lib.mkdir()
+    _file(tmp_path / "NIKON" / "DCIM" / "100" / "A.JPG", b"a" * 50)
+    run_import(tmp_path / "NIKON", lib, "Rome", [".jpg"])
+    (lib / "Keep").mkdir()
+    (lib / "2026" / "2026-09-05_Rome" / "A.JPG").rename(lib / "Keep" / "A.JPG")
+    assert baidu.pending_cloud(lib, "jpeg") == 1
+    assert baidu.upload_library(lib, client, "jpeg").uploaded == 1
+    assert list(server["files"]) == ["/apps/Photoman/Keep/A.JPG"]

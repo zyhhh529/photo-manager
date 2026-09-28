@@ -100,3 +100,12 @@ def test_imports_without_new_files_or_dry_runs_are_not_trips(tmp_path, library):
     run_import(card, library, "Rome", EXTS)                     # nothing new
     [t] = trips.trips_from_logs(library)
     assert t.imports == 1
+
+
+def test_trip_counts_follow_moved_photos(tmp_path, library):
+    card = _card(tmp_path, "c1", [("A.NEF", b"a", datetime(2026, 9, 5, 10)), ("B.NEF", b"b", datetime(2026, 9, 5, 11))])
+    run_import(card, library, "Rome", EXTS)
+    (library / "Best").mkdir()
+    (library / "2026" / "2026-09-05_Rome" / "A.NEF").rename(library / "Best" / "A.NEF")
+    [t] = trips.load_trips([str(library)], None)
+    assert t.photos == 2
