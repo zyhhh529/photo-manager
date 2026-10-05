@@ -16,7 +16,7 @@ from AppKit import (
 )
 from Foundation import NSURL, NSMakeRect, NSObject
 
-from .importer import dest_folder, sanitize_trip, with_partners
+from .importer import planned_folders, with_partners
 from .macui import activate_app, alert, check_destination, choose_folder, drive_label, free_space, human_size
 
 WIDTH = 460
@@ -382,11 +382,10 @@ class ImportWindow(NSObject):
             self.preview_label.setHidden_(True)
             self.fit()
             return
-        trip = sanitize_trip(self.trip_field.stringValue())
-        days = sorted({d.date() for d in dates})
-        first = dest_folder(lib, min(dates), trip)
-        more = f"  (+{len(days) - 1} more date folder{'s' if len(days) > 2 else ''})" if len(days) > 1 else ""
-        self.preview_label.setStringValue_(f"→ {first}{more}")
+        folders = planned_folders(lib, dates, self.trip_field.stringValue(), self.app.cfg.get("group_by", "trip"))
+        more = f"  (+{len(folders) - 1} more date folder{'s' if len(folders) > 2 else ''})" if len(folders) > 1 else ""
+        reuse = "  (existing trip folder)" if len(folders) == 1 and folders[0].is_dir() else ""
+        self.preview_label.setStringValue_(f"→ {folders[0]}{more}{reuse}")
         self.preview_label.setHidden_(False)
         self.fit()
 
@@ -406,7 +405,9 @@ class ImportWindow(NSObject):
         self.state = "running"
         self.form.setHidden_(True)
         self.progress_box.setHidden_(False)
-        self.cancel_button.setHidden_(True)
+        self.cancel_button.setTitle_("Stop")
+        self.cancel_button.setAction_("stopClicked:")
+        self.cancel_button.setKeyEquivalent_("")
         self.import_button.setEnabled_(False)
         self.import_button.setTitle_("Importing…")
         what = "" if self.selected is None else f"{len(self.selected)} selected files "
@@ -416,6 +417,11 @@ class ImportWindow(NSObject):
 
     def cancelClicked_(self, _sender):
         self.close()
+
+    def stopClicked_(self, _sender):
+        self.app.request_stop()
+        self.cancel_button.setTitle_("Stopping…")
+        self.cancel_button.setEnabled_(False)
 
     def doneClicked_(self, _sender):
         self.close()
@@ -450,6 +456,7 @@ class ImportWindow(NSObject):
         self.result_detail.setStringValue_(detail)
         self.result_box.setHidden_(False)
         self.import_button.setHidden_(True)
+        self.cancel_button.setHidden_(True)
         self.reveal_button.setHidden_(False)
         ejectable = level != "error"  # a card that's only waiting for its backup can still be ejected
         self.logs_button.setHidden_(level != "error")

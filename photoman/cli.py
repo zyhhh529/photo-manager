@@ -58,6 +58,8 @@ def record_backup(library: Path, backup: Path) -> bool:
 def format_advice(res) -> str:
     if res.safe_to_format:
         return "✅ All files verified" + (" and backed up" if res.backup_root else "") + ", safe to format the card"
+    if res.stopped and not res.failed:
+        return "⚠️ Import stopped before every file was imported; keep the card and import again to finish"
     if res.failed or res.in_library + res.not_selected < res.total:
         return "⚠️ Some files failed to import, do NOT format the card"
     if res.not_selected:
@@ -217,7 +219,7 @@ def main(argv=None) -> int:
     try:
         res = run_import(args.source, library, args.trip, cfg["extensions"],
                          dry_run=args.dry_run, backup_root=backup, progress=_progress,
-                         backup_policy=cfg["backup_originals"], only=only)
+                         backup_policy=cfg["backup_originals"], only=only, group_by=cfg["group_by"])
     except (FileNotFoundError, PermissionError) as e:
         print(e, file=sys.stderr)
         return 2

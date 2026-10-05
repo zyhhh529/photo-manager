@@ -28,7 +28,8 @@ from typing import Callable, Dict, Iterable, List, Optional, Tuple
 CHUNK = 4 * 1024 * 1024
 META_DIR = ".photoman"
 EDITED_SUFFIX = "_Edited"   # 2026/2026-09-05_Rome_Edited/: Lightroom exports for that trip
-SETTLE_SECONDS = 60         # edited files changed more recently than this may still be being exported
+SETTLE_SECONDS = 60
+DATE_BATCH = 250            # files per exiftool run when reading capture dates         # edited files changed more recently than this may still be being exported
 
 
 # ---------------------------------------------------------------- scanning
@@ -95,7 +96,9 @@ def read_capture_dates(files: List[Path]) -> Dict[Path, datetime]:
             out = subprocess.run(
                 [tool, "-json", "-charset", "filename=utf8", "-fast2",
                  *[f"-{t}" for t in _DATE_TAGS], "-@", argfile],
-                capture_output=True, text=True, check=False,
+                # explicit UTF-8: the login item may run with an ASCII default encoding, and exiftool's
+                # output contains non-ASCII text (file names, camera strings)
+                capture_output=True, encoding="utf-8", errors="replace", check=False,
             ).stdout
             for rec in json.loads(out or "[]"):
                 src = Path(rec.get("SourceFile", ""))
@@ -167,9 +170,39 @@ TRIP_GAP_DAYS = 30  # imports with the same trip name this close together are th
 
 
 def edited_folder_for(date_folder: Path) -> Path:
-    """The Edited folder for an import: next to its first date folder, e.g. 2026/2026-09-05_Rome_Edited."""
+    """The Edited folder for a photos folder: right next to it, e.g. 2026/2026-09-05_Rome_Edited."""
     date_folder = Path(date_folder)
     return date_folder.with_name(date_folder.name + EDITED_SUFFIX)
+
+
+def trip_folder(library_root: Path, first_day: datetime, trip: str) -> Path:
+    """The one folder a trip's photos go in: <year>/<first day>_<trip>, e.g. 2026/2026-09-05_Rome (just the date
+    when there's no trip name). A later card from the same trip (same name, within TRIP_GAP_DAYS of an existing
+    folder or its Edited folder) goes into that existing folder."""
+    new = dest_folder(library_root, first_day, trip)
+    if not trip:
+        return new
+    pattern = re.compile(r"^(\d{4}-\d{2}-\d{2})_" + re.escape(trip) + "(" + re.escape(EDITED_SUFFIX) + ")?$")
+    candidates = []
+    for p in Path(library_root).glob("*/*"):
+        m = pattern.match(p.name)
+        if m and p.is_dir():
+            gap = abs((datetime.strptime(m.group(1), "%Y-%m-%d") - first_day.replace(hour=0, minute=0, second=0,
+                                                                                  microsecond=0)).days)
+            if gap <= TRIP_GAP_DAYS:
+                candidates.append((gap, str(p.parent / f"{m.group(1)}_{trip}")))
+    return Path(min(candidates)[1]) if candidates else new
+
+
+def planned_folders(library_root: Path, dates: Iterable[datetime], trip: str, group_by: str = "trip") -> List[Path]:
+    """Folders an import of photos taken at `dates` will use: one per trip, or one per day."""
+    dates = list(dates)
+    if not dates:
+        return []
+    trip = sanitize_trip(trip)
+    if group_by == "trip":
+        return [trip_folder(library_root, min(dates), trip)]
+    return sorted({dest_folder(library_root, d, trip) for d in dates})
 
 
 def trip_edited_folder(library_root: Path, first_date_folder: Path, trip: str) -> Path:
@@ -265,6 +298,11 @@ class Index:
         row = self.db.execute("SELECT rel_path FROM files WHERE sha256=?", (sha,)).fetchone()
         return row[0] if row else None
 
+    def by_name_and_size(self, name: str, size: int) -> Optional[tuple]:
+        """Looser match for card files left out of a partial import (their capture time isn't read)."""
+        return self.db.execute("SELECT sha256, rel_path FROM files WHERE orig_name=? AND size=? AND gone=0",
+                               (name, size)).fetchone()
+
     def by_signature(self, name: str, size: int, captured: datetime) -> Optional[tuple]:
         row = self.db.execute(
             "SELECT sha256, rel_path FROM files WHERE orig_name=? AND size=? AND captured_at=?",
@@ -330,6 +368,7 @@ class FileResult:
     status: str  # copied / already_imported / duplicate / failed / would_copy / not_selected
     dest: Optional[str] = None
     sha: Optional[str] = None
+    captured: Optional[str] = None   # capture time (ISO), so trips know their dates whatever the folders
     error: Optional[str] = None
     backup_ok: Optional[bool] = None
 
@@ -349,6 +388,7 @@ class ImportResult:
     failed: int = 0
     would_copy: int = 0
     not_selected: int = 0               # left on the card by a partial import
+    stopped: bool = False               # stopped by the user before every file was handled
     bytes_copied: int = 0
     backup_root: Optional[str] = None    # configured travel backup, whether or not it's connected
     backup_error: Optional[str] = None   # why the backup couldn't run ("not connected", "read-only")
@@ -373,7 +413,7 @@ class ImportResult:
     @property
     def safe_to_format(self) -> bool:
         """Every file on the card is safely in the photo library, and on the travel backup drive if one is set."""
-        return (not self.dry_run and self.total > 0 and self.failed == 0
+        return (not self.dry_run and not self.stopped and self.total > 0 and self.failed == 0
                 and self.in_library == self.total and self.backup_pending == 0)
 
     def summary(self) -> str:
@@ -384,6 +424,8 @@ class ImportResult:
              f"{self.duplicate} duplicates, {self.failed} failed")
         if self.not_selected:
             s += f", {self.not_selected} not selected"
+        if self.stopped:
+            s += f", stopped with {self.total - len(self.files)} files not looked at"
         if self.backup_root and self.backup_error:
             s += f"; travel backup {self.backup_error}"
         elif self.backup_root:
@@ -519,9 +561,13 @@ def run_import(
     progress: Optional[ProgressCB] = None,
     backup_policy: str = "all",
     only: Optional[Iterable] = None,
+    group_by: str = "day",
+    should_stop: Optional[Callable[[], bool]] = None,
 ) -> ImportResult:
     """Import `source` into `library_root`. With `only`, just those card files are copied; the rest are
-    checked (already imported?) but left on the card, so the card isn't reported safe to format."""
+    checked (already imported?) but left on the card, so the card isn't reported safe to format.
+    group_by: "trip" puts everything in one folder per trip (2026/2026-09-05_Rome), "day" one per shooting day.
+    should_stop: checked between files; when it returns True the import stops (finished files are kept)."""
     source, library_root = Path(source), Path(library_root)
     trip = sanitize_trip(trip)
     res = ImportResult(
@@ -540,12 +586,22 @@ def run_import(
 
     files = scan_media(source, extensions)
     res.total = len(files)
-    dates = read_capture_dates(files)
+    selected = None if only is None else {str(Path(p)) for p in only}
+    # Capture times only for the files being imported (exiftool reads ~50 files/s from a card), in batches so
+    # the progress shows something instead of sitting at "Starting…" on a big card.
+    need = [f for f in files if selected is None or str(f) in selected]
+    dates: Dict[Path, datetime] = {}
+    for start in range(0, len(need), DATE_BATCH):
+        if progress:
+            progress(start, len(need), "Reading capture dates…")
+        dates.update(read_capture_dates(need[start:start + DATE_BATCH]))
     index = Index(library_root, readonly=dry_run)
     folders = set()
     card_raws = raw_keys(files)
-    selected = None if only is None else {str(Path(p)) for p in only}
     reconciled = False
+    import_dates = [dates[f] for f in files if selected is None or str(f) in selected]
+    the_trip_folder = (trip_folder(library_root, min(import_dates), trip)
+                       if group_by == "trip" and import_dates else None)
 
     def in_library(rel: Optional[str]) -> bool:
         """Is the indexed file still there? If not, it may have been moved or renamed: look for it by content
@@ -570,32 +626,44 @@ def run_import(
                 res.backup_failed += 1
 
     try:
-        for i, src in enumerate(files, 1):
-            if progress:
-                progress(i, len(files), src.name)
-            captured = dates[src]
+        todo = [f for f in files if selected is None or str(f) in selected]
+        done = 0
+        for src in files:
+            chosen = selected is None or str(src) in selected
+            if chosen:
+                if should_stop and should_stop():
+                    res.stopped = True
+                    break
+                done += 1
+                if progress:
+                    progress(done, len(todo), src.name)
+            captured = dates.get(src)   # None for files left out of a partial import
             size = src.stat().st_size
-            fr = FileResult(source=str(src), status="")
+            fr = FileResult(source=str(src), status="", captured=captured.isoformat() if captured else None)
             res.files.append(fr)
             try:
                 # 1) Fast check: same name, size and capture time → confirm with the hash.
                 #    Only counts if the file is still in the library (it may have been deleted since).
-                sig = index.by_signature(src.name, size, captured)
+                lookup = ((lambda: index.by_signature(src.name, size, captured)) if chosen
+                          else (lambda: index.by_name_and_size(src.name, size)))
+                sig = lookup()
                 if sig and not in_library(sig[1]):
-                    sig = index.by_signature(src.name, size, captured)  # found where it was moved to?
+                    sig = lookup()  # found where it was moved to?
                 if sig and (library_root / sig[1]).is_file():
-                    if dry_run or sha256_file(src) == sig[0]:
+                    # Files left out of a partial import are only matched by name and size: re-reading
+                    # (hashing) them would mean reading the whole card just to skip them.
+                    if dry_run or not chosen or sha256_file(src) == sig[0]:
                         fr.status, fr.dest, fr.sha = "already_imported", sig[1], sig[0]
                         res.already_imported += 1
                         back_up(fr, sig[0], sig[1])  # e.g. imported while the backup drive wasn't connected
                         continue
 
-                if selected is not None and str(src) not in selected:
+                if not chosen:
                     fr.status = "not_selected"  # stays on the card; a later import can pick it up
                     res.not_selected += 1
                     continue
 
-                folder = dest_folder(library_root, captured, trip)
+                folder = the_trip_folder or dest_folder(library_root, captured, trip)
                 if dry_run:
                     fr.status, fr.dest = "would_copy", str(folder / src.name)
                     res.would_copy += 1
@@ -641,7 +709,8 @@ def run_import(
 
     res.folders = sorted(folders)
     if res.folders and not dry_run:
-        edited = trip_edited_folder(library_root, Path(res.folders[0]), trip)
+        edited = (edited_folder_for(the_trip_folder) if the_trip_folder
+                  else trip_edited_folder(library_root, Path(res.folders[0]), trip))
         try:
             edited.mkdir(exist_ok=True)
             res.edited_folder = str(edited)

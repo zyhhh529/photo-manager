@@ -506,3 +506,56 @@ def test_edited_folder_moved_into_a_subfolder_is_still_backed_up(pair_card, libr
     _export(moved / "best.jpg", b"edit")
     assert importer.backup_library(library, backup).edited_copied == 1
     assert (backup / "2026/Italy/2026-09-05_Rome_Edited/best.jpg").is_file()
+
+
+@pytest.mark.skipif(not HAS_EXIFTOOL, reason="requires exiftool")
+def test_capture_dates_with_ascii_default_encoding(tmp_path):
+    """The login item can run with an ASCII default encoding; exiftool output with non-ASCII text
+    (here a Chinese file name) must still be read. Runs in a fresh Python whose locale is really ASCII."""
+    import sys
+    photo = tmp_path / "照片_é.jpg"
+    _jpg(photo, "2026:09:05 10:00:00")
+    code = ("import sys; from pathlib import Path; from photoman.importer import read_capture_dates; "
+            "print([str(d) for d in read_capture_dates([Path(sys.argv[1])]).values()])")
+    env = {"HOME": os.environ.get("HOME", ""), "PATH": "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin",
+           "LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONCOERCECLOCALE": "0",
+           "PYTHONPATH": str(Path(__file__).resolve().parents[1])}
+    r = subprocess.run([sys.executable, "-c", code, str(photo)], capture_output=True, env=env)
+    assert r.returncode == 0, r.stderr.decode(errors="replace")
+    assert r.stdout.decode().strip() == "['2026-09-05 10:00:00']"
+
+
+def test_partial_import_only_reads_the_selected_files(pair_card, library, monkeypatch):
+    run_import(pair_card, library, "Rome", EXTS)                       # everything imported once
+    (pair_card / "DCIM" / "100NZ6_2" / "DSC_0009.JPG").write_bytes(b"new shot")
+    files = scan_media(pair_card, EXTS)
+    new = [f for f in files if f.name == "DSC_0009.JPG"]
+    read = []
+    real = importer.sha256_file
+    monkeypatch.setattr(importer, "sha256_file", lambda p: (read.append(Path(p).name), real(p))[1])
+    seen = []
+    res = run_import(pair_card, library, "Rome", EXTS, only=new, progress=lambda i, n, name: seen.append((i, n, name)))
+    assert seen == [(0, 1, "Reading capture dates…"), (1, 1, "DSC_0009.JPG")]   # progress covers the selection only
+    assert res.copied == 1 and res.already_imported == 4 and res.not_selected == 0
+    assert read == ["DSC_0009.JPG.part"]   # only the new copy is verified; already-imported files aren't re-read
+
+
+def test_stopping_an_import_keeps_what_was_done(pair_card, library):
+    calls = []
+    res = run_import(pair_card, library, "Rome", EXTS, should_stop=lambda: len(calls) >= 2,
+                     progress=lambda i, n, name: name.endswith("…") or calls.append(name))
+    assert res.stopped and res.copied == 2 and not res.safe_to_format
+    assert "stopped with 2 files not looked at" in res.summary()
+    assert not list(library.rglob("*.part"))
+    assert len(list((library / ".photoman" / "imports").glob("*.json"))) == 1   # the stop is logged
+    rest = run_import(pair_card, library, "Rome", EXTS)                          # carry on later
+    assert (rest.copied, rest.already_imported) == (2, 2) and rest.safe_to_format
+
+
+def test_partial_import_reads_capture_dates_of_the_selection_only(pair_card, library, monkeypatch):
+    asked = []
+    real = importer.read_capture_dates
+    monkeypatch.setattr(importer, "read_capture_dates", lambda fs: (asked.extend(Path(f).name for f in fs), real(fs))[1])
+    first = [f for f in scan_media(pair_card, EXTS) if f.name.startswith("DSC_0001")]
+    res = run_import(pair_card, library, "Rome", EXTS, only=first)
+    assert sorted(asked) == ["DSC_0001.JPG", "DSC_0001.NEF"] and res.copied == 2 and res.not_selected == 2

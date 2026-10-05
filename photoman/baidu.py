@@ -318,6 +318,20 @@ def pending_cloud(library_root: Path, policy: str) -> int:
         index.close()
 
 
+def cloud_counts(library_root: Path, policy: str) -> tuple:
+    """(already uploaded, still waiting) for one destination: the whole picture, not just one upload round."""
+    waiting = pending_cloud(library_root, policy)
+    candidates = cloud_candidates(library_root, policy)
+    if not candidates:
+        return 0, waiting
+    root = cloud_root()
+    index = Index(Path(library_root), readonly=True)
+    try:
+        return sum(1 for rel, st in candidates if _uploaded(index, rel, st, root)), waiting
+    finally:
+        index.close()
+
+
 def upload_library(library_root: Path, client: Baidu, policy: str, progress: Optional[ProgressCB] = None,
                    should_stop: Optional[Callable[[], bool]] = None) -> CloudResult:
     library_root = Path(library_root)

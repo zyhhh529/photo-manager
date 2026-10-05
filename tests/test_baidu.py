@@ -278,3 +278,17 @@ def test_originals_moved_before_upload_are_found(client, server, tmp_path):
     assert baidu.pending_cloud(lib, "jpeg") == 1
     assert baidu.upload_library(lib, client, "jpeg").uploaded == 1
     assert list(server["files"]) == ["/apps/Photoman/Keep/A.JPG"]
+
+
+def test_cloud_counts_cover_everything_not_just_one_round(client, server, tmp_path):
+    lib = tmp_path / "PhotoA"
+    lib.mkdir()
+    for k in range(4):
+        _file(tmp_path / "NIKON" / "DCIM" / "100" / f"P{k}.JPG", bytes([k]) * 10)
+    _file(tmp_path / "NIKON" / "DCIM" / "100" / "P0.NEF", b"raw")
+    run_import(tmp_path / "NIKON", lib, "", [".jpg", ".nef"])
+    assert baidu.cloud_counts(lib, "jpeg") == (0, 4)                   # RAW isn't counted
+    calls = []
+    baidu.upload_library(lib, client, "jpeg", progress=lambda i, n, name: calls.append(i),
+                         should_stop=lambda: len(calls) >= 2)
+    assert baidu.cloud_counts(lib, "jpeg") == (2, 2)                   # 2 of 4, after a restart too

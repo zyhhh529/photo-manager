@@ -13,7 +13,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 
 import rumps
-from AppKit import NSWorkspace
+from AppKit import (NSAppearanceNameAqua, NSAppearanceNameDarkAqua, NSAttributedString, NSColor, NSFont,
+                    NSFontAttributeName, NSForegroundColorAttributeName, NSImage, NSMutableAttributedString,
+                    NSTextAttachment, NSString, NSWorkspace)
 from Foundation import NSURL
 from PyObjCTools.AppHelper import callAfter
 
@@ -26,7 +28,49 @@ from .macui import alert, choose_folder, drive_label, float_above, free_space, h
 
 POLL_SECONDS = 2
 RECHECK_BACKUP_EVERY = 150  # ticks (5 minutes): look for new Lightroom exports to back up
+_camera = None
 
+
+def camera_image():
+    """The 📷 emoji as a small image, placed inside the menu bar text. (Set as the status item's own image,
+    macOS draws it, and the text next to it, dimmed.)"""
+    global _camera
+    if _camera is None:
+        _camera = NSImage.alloc().initWithSize_((18, 16))
+        _camera.lockFocus()
+        NSString.stringWithString_("📷").drawAtPoint_withAttributes_((0, 0), {NSFontAttributeName: NSFont.systemFontOfSize_(13)})
+        _camera.unlockFocus()
+    return _camera
+
+
+def _lines_image(top: str, bottom: str, dark: bool):
+    """Two small lines of text drawn into one image, so they stack exactly in the menu bar."""
+    attrs = {NSFontAttributeName: NSFont.monospacedDigitSystemFontOfSize_weight_(9.5, 0.2),
+             NSForegroundColorAttributeName: NSColor.whiteColor() if dark else NSColor.blackColor()}
+    texts = [NSString.stringWithString_(t) for t in (top, bottom)]
+    width = max(t.sizeWithAttributes_(attrs).width for t in texts) + 1
+    img = NSImage.alloc().initWithSize_((width, 22))
+    img.lockFocus()
+    texts[0].drawAtPoint_withAttributes_((0, 10.5), attrs)
+    texts[1].drawAtPoint_withAttributes_((0, 0), attrs)
+    img.unlockFocus()
+    return img
+
+
+def _attachment(image, y):
+    att = NSTextAttachment.alloc().init()
+    att.setImage_(image)
+    att.setBounds_(((0, y), image.size()))
+    return NSAttributedString.attributedStringWithAttachment_(att)
+
+
+def two_line_title(top: str, bottom: str, dark: bool):
+    """📷 and, next to it, two small lines: import progress on top, Baidu Netdisk below."""
+    title = NSMutableAttributedString.alloc().init()
+    title.appendAttributedString_(_attachment(camera_image(), -3))
+    title.appendAttributedString_(NSAttributedString.alloc().initWithString_(" "))
+    title.appendAttributedString_(_attachment(_lines_image(top, bottom, dark), -6))
+    return title
 
 class PhotomanApp(rumps.App):
     def __init__(self):
@@ -34,6 +78,7 @@ class PhotomanApp(rumps.App):
         self.cfg = config.load_config()
         self.seen = {str(p) for p in find_cards()}  # cards inserted before launch don't trigger a prompt
         self.busy = False        # an import is running
+        self.stop_requested = False
         self.backing_up = False  # a catch-up backup is running
         self.progress = (0, 0)
         self.backup_pending = 0  # imported files not yet on the travel backup drive
@@ -80,6 +125,24 @@ class PhotomanApp(rumps.App):
         rumps.Timer(self.tick, POLL_SECONDS).start()
 
     # ------------------------------------------------------------ status display
+
+    def update_title(self):
+        """Text next to the menu bar icon. One task: one line ("📷 ⇣ 12/160"). An import (⇣, or ⇪ for a drive
+        backup) and a Baidu Netdisk upload (☁) at the same time: two small lines, import on top, cloud below."""
+        top = bottom = None
+        if self.busy or self.backing_up:
+            i, n = self.progress
+            top = ("⇪ " if self.backing_up else "⇣ ") + (f"{i}/{n}" if n else "…")
+        if self.uploading:
+            i, n = self.cloud_progress
+            bottom = f"☁ {i}/{n}"
+        item = getattr(getattr(self, "_nsapp", None), "nsstatusitem", None)
+        if top and bottom and item is not None:
+            match = item.button().effectiveAppearance().bestMatchFromAppearancesWithNames_(
+                [NSAppearanceNameAqua, NSAppearanceNameDarkAqua])
+            item.setAttributedTitle_(two_line_title(top, bottom, dark=match == NSAppearanceNameDarkAqua))
+            return
+        self.title = " ".join(["📷", *[t for t in (top, bottom) if t]])
 
     def library_root(self):
         lr = self.cfg.get("library_root")
@@ -263,6 +326,7 @@ class PhotomanApp(rumps.App):
         config.remember_library(self.cfg, lib)
         config.save_config(self.cfg)
         backup = self.cfg.get("travel_backup_root")
+        self.stop_requested = False
         self.busy = True
         self.progress = (0, 0)
         self.last_card = str(card)
@@ -273,7 +337,9 @@ class PhotomanApp(rumps.App):
                 res = run_import(card, lib, trip, self.cfg["extensions"],
                                  backup_root=Path(backup) if backup else None,
                                  progress=lambda i, n, name: callAfter(self.on_progress, i, n, name),
-                                 backup_policy=self.cfg["backup_originals"], only=only)
+                                 backup_policy=self.cfg["backup_originals"], only=only,
+                                 group_by=self.cfg.get("group_by", "trip"),
+                                 should_stop=lambda: self.stop_requested)
                 callAfter(self.on_import_done, card, res)
             except Exception as e:
                 traceback.print_exc()
@@ -282,15 +348,19 @@ class PhotomanApp(rumps.App):
         threading.Thread(target=work, daemon=True).start()
         return True
 
+    def request_stop(self):
+        """Stop the running import before its next file; files already imported and verified are kept."""
+        self.stop_requested = True
+
     def on_progress(self, i: int, n: int, name: str):
         self.progress = (i, n)
-        self.title = f"📷 {i}/{n}"
+        self.update_title()
         if self.window:
             self.window.show_progress(i, n, name)
 
     def on_import_done(self, card: Path, outcome):
         self.busy = False
-        self.title = "📷"
+        self.update_title()
         if isinstance(outcome, Exception):
             title, detail, level = "Import failed — do NOT format the card", str(outcome), "error"
         else:
@@ -316,10 +386,15 @@ class PhotomanApp(rumps.App):
             more = f" (+{len(res.folders) - 5} more)" if len(res.folders) > 5 else ""
             lines.append("Folders: " + ", ".join(shown) + more)
         if res.edited_folder:
-            lines.append(f"Export your Lightroom edits to {Path(res.edited_folder).name} (next to the date folders)"
+            lines.append(f"Export your Lightroom edits to {Path(res.edited_folder).name} (next to the photos folder)"
                          + (" — it's backed up too." if res.backup_root else "."))
         bak = Path(res.backup_root) if res.backup_root else None
 
+        if res.stopped and not res.failed:
+            lines.append(f"Stopped before {res.total - len(res.files)} of the files were looked at; everything "
+                         f"imported so far is verified and kept. Choose “Import from Card…” to carry on — "
+                         f"what's already imported is skipped. Keep the card until then.")
+            return f"Import stopped — {res.copied} files imported", "\n\n".join(lines), "warn"
         if res.failed or res.in_library + res.not_selected < res.total:
             failed = [f for f in res.files if f.status == "failed"]
             lines.append("Failed:\n" + "\n".join(f"• {Path(f.source).name}: {f.error}" for f in failed[:5])
@@ -378,12 +453,12 @@ class PhotomanApp(rumps.App):
 
     def on_backup_progress(self, i: int, n: int):
         self.progress = (i, n)
-        self.title = f"📷 ⇪ {i}/{n}"
+        self.update_title()
         self.refresh_menu()
 
     def on_backup_done(self, bak: Path, results, error, manual: bool):
         self.backing_up = False
-        self.title = "📷"
+        self.update_title()
         copied = sum(r.copied for r in results)
         edited = sum(r.edited_copied for r in results)
         failed = sum(r.failed_total for r in results)
@@ -429,21 +504,28 @@ class PhotomanApp(rumps.App):
             return
         policy = self.cfg.get("cloud_originals", "jpeg")
         libs = self.connected_libraries()
-        self.cloud_pending = sum(baidu.pending_cloud(p, policy) for p in libs)
+        counts = [baidu.cloud_counts(p, policy) for p in libs]
+        already = sum(done for done, _ in counts)
+        self.cloud_pending = sum(waiting for _, waiting in counts)
         if not self.cloud_pending:
             self.refresh_cloud_item()
             return
         self.uploading = True
-        self.cloud_progress = (0, self.cloud_pending)
+        # overall progress: "☁ 147/1175" = uploaded so far / everything that belongs in the cloud
+        total = already + self.cloud_pending
+        self.cloud_progress = (already, total)
 
         def work():
             results, error = [], None
             try:
                 client = baidu.Baidu()
+                done = already  # one running count across all destinations and rounds
                 for lib in libs:
                     results.append(baidu.upload_library(
                         lib, client, policy,
-                        progress=lambda i, n, _name: callAfter(self.on_cloud_progress, i, n)))
+                        progress=lambda i, n, _name, base=done: callAfter(
+                            self.on_cloud_progress, base + i, max(total, base + n))))
+                    done += results[-1].uploaded + results[-1].failed
             except Exception as e:
                 traceback.print_exc()
                 error = e
@@ -451,13 +533,16 @@ class PhotomanApp(rumps.App):
 
         threading.Thread(target=work, daemon=True).start()
         self.refresh_cloud_item()
+        self.update_title()
 
     def on_cloud_progress(self, i: int, n: int):
         self.cloud_progress = (i, n)
         self.refresh_cloud_item()
+        self.update_title()
 
     def on_cloud_done(self, results, error):
         self.uploading = False
+        self.update_title()
         uploaded = sum(r.uploaded for r in results)
         failed = sum(r.failed for r in results)
         if isinstance(error, baidu.BaiduAuthError):
@@ -474,6 +559,10 @@ class PhotomanApp(rumps.App):
         self.cloud_pending = sum(baidu.pending_cloud(p, policy) for p in self.connected_libraries())
         self.refresh_cloud_item()
         self.refresh_trips()
+        # Photos imported (or edits exported) while this round ran: start the next round now, not in 5 minutes.
+        # Only after a round that made progress, so a failing upload doesn't retry in a tight loop.
+        if self.cloud_pending and not error and uploaded:
+            callAfter(self.start_cloud_upload)
 
     def on_setup_baidu(self, _):
         creds = baidu.load_credentials()
@@ -559,7 +648,8 @@ class PhotomanApp(rumps.App):
     def eject_card(self) -> bool:
         if not self.last_card:
             return False
-        r = subprocess.run(["diskutil", "eject", self.last_card], capture_output=True, text=True)
+        r = subprocess.run(["diskutil", "eject", self.last_card], capture_output=True, encoding="utf-8",
+                           errors="replace")
         if r.returncode == 0:
             notify("Photoman", "Card ejected — you can remove it now")
         else:
@@ -572,7 +662,7 @@ class PhotomanApp(rumps.App):
         folders = [f for f in [*((last or {}).get("folders") or []), (last or {}).get("edited_folder")]
                    if f and Path(f).is_dir()]
         if folders:
-            # One Finder window with this import's date folders selected, not a window per folder
+            # One Finder window with this import's folders selected, not a window per folder
             urls = [NSURL.fileURLWithPath_(f) for f in folders]
             NSWorkspace.sharedWorkspace().activateFileViewerSelectingURLs_(urls)
         elif last:
@@ -585,7 +675,7 @@ class PhotomanApp(rumps.App):
         if edited and Path(edited).is_dir():
             subprocess.run(["open", edited])
         else:
-            alert("No Edited folder yet", "Photoman creates one next to the date folders when you import.")
+            alert("No Edited folder yet", "Photoman creates one next to the photos folder when you import.")
 
     def on_open_library(self, _):
         lib = self.library_root()
@@ -627,6 +717,11 @@ class PhotomanApp(rumps.App):
 
 
 def main():
+    import locale
+    import sys
+    print(f"Photoman starting (Python {sys.version.split()[0]}, text encoding "
+          f"{locale.getpreferredencoding(False)}, filesystem encoding {sys.getfilesystemencoding()})",
+          file=sys.stderr, flush=True)
     PhotomanApp().run()
 
 

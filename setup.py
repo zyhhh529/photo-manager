@@ -13,6 +13,8 @@ setup(
             "CFBundleIdentifier": "com.photoman.menubar",
             "CFBundleShortVersionString": "0.2",
             "LSUIElement": True,  # menu bar only, no Dock icon
+            # without a locale, the embedded Python can default to ASCII and fail on non-ASCII text
+            "LSEnvironment": {"LANG": "en_US.UTF-8", "LC_CTYPE": "en_US.UTF-8", "PYTHONUTF8": "1"},
             "NSHumanReadableCopyright": "",
         },
     }},

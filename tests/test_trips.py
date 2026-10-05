@@ -109,3 +109,69 @@ def test_trip_counts_follow_moved_photos(tmp_path, library):
     (library / "2026" / "2026-09-05_Rome" / "A.NEF").rename(library / "Best" / "A.NEF")
     [t] = trips.load_trips([str(library)], None)
     assert t.photos == 2
+
+
+# ---------------------------------------------------------------- one folder per trip
+
+def _names(lib):
+    return sorted(str(p.relative_to(lib)) for p in lib.rglob("*") if p.is_file() and ".photoman" not in p.parts)
+
+
+def test_one_folder_per_trip(tmp_path, library):
+    card = _card(tmp_path, "c1", [("DSC_0001.NEF", b"a", datetime(2026, 9, 5, 10)),
+                                  ("DSC_0002.NEF", b"b", datetime(2026, 9, 6, 10)),
+                                  ("DSC_0003.NEF", b"c", datetime(2026, 9, 8, 10))])
+    res = run_import(card, library, "Rome", EXTS, group_by="trip")
+    assert _names(library) == ["2026/2026-09-05_Rome/DSC_0001.NEF", "2026/2026-09-05_Rome/DSC_0002.NEF",
+                               "2026/2026-09-05_Rome/DSC_0003.NEF"]
+    assert res.folders == [str(library / "2026" / "2026-09-05_Rome")]
+    assert res.edited_folder == str(library / "2026" / "2026-09-05_Rome_Edited")
+    [t] = trips.trips_from_logs(library)
+    assert t.date_range == "Sep 5 – Sep 8, 2026" and t.folders == ["2026/2026-09-05_Rome"]
+
+
+def test_second_card_goes_into_the_same_trip_folder(tmp_path, library):
+    run_import(_card(tmp_path, "c1", [("DSC_0001.NEF", b"a", datetime(2026, 9, 5, 10))]), library, "Rome", EXTS,
+               group_by="trip")
+    r2 = run_import(_card(tmp_path, "c2", [("DSC_0001.NEF", b"other", datetime(2026, 9, 9, 10))]), library,
+                    "Rome", EXTS, group_by="trip")
+    assert _names(library) == ["2026/2026-09-05_Rome/DSC_0001.NEF", "2026/2026-09-05_Rome/DSC_0001_1.NEF"]
+    assert r2.edited_folder == str(library / "2026" / "2026-09-05_Rome_Edited")
+    [t] = trips.trips_from_logs(library)
+    assert t.imports == 2 and t.date_range == "Sep 5 – Sep 9, 2026"
+
+
+def test_partial_imports_of_a_trip_share_one_folder(tmp_path, library):
+    card = _card(tmp_path, "c1", [("DSC_0001.NEF", b"a", datetime(2026, 9, 5, 10)),
+                                  ("DSC_0002.NEF", b"b", datetime(2026, 9, 6, 10))])
+    later = [str(p) for p in card.rglob("DSC_0002.NEF")]
+    run_import(card, library, "Rome", EXTS, group_by="trip", only=later)        # Sep 6 first
+    run_import(card, library, "Rome", EXTS, group_by="trip")                    # then the rest
+    assert _names(library) == ["2026/2026-09-06_Rome/DSC_0001.NEF", "2026/2026-09-06_Rome/DSC_0002.NEF"]
+
+
+def test_no_trip_name_is_one_folder_per_import(tmp_path, library):
+    card = _card(tmp_path, "c1", [("A.NEF", b"a", datetime(2026, 9, 5, 10)), ("B.NEF", b"b", datetime(2026, 9, 7, 10))])
+    run_import(card, library, "", EXTS, group_by="trip")
+    assert _names(library) == ["2026/2026-09-05/A.NEF", "2026/2026-09-05/B.NEF"]
+
+
+def test_planned_folders_matches_the_import(tmp_path, library):
+    from photoman.importer import planned_folders
+    days = [datetime(2026, 9, 5, 10), datetime(2026, 9, 7, 9)]
+    assert planned_folders(library, days, "Rome", "trip") == [library / "2026" / "2026-09-05_Rome"]
+    assert planned_folders(library, days, "Rome", "day") == [library / "2026" / "2026-09-05_Rome",
+                                                               library / "2026" / "2026-09-07_Rome"]
+    (library / "2026" / "2026-09-01_Rome").mkdir(parents=True)                  # an existing trip folder
+    assert planned_folders(library, days, "Rome", "trip") == [library / "2026" / "2026-09-01_Rome"]
+
+
+def test_files_already_imported_by_another_trip_are_not_counted(tmp_path, library):
+    card = _card(tmp_path, "c1", [("A.NEF", b"a", datetime(2026, 9, 5, 10)), ("B.NEF", b"b", datetime(2026, 9, 6, 10)),
+                                  ("C.NEF", b"c", datetime(2026, 11, 20, 10))])
+    first = [str(p) for p in card.rglob("*") if p.name in ("A.NEF", "B.NEF")]
+    run_import(card, library, "Rome", EXTS, group_by="trip", only=first)
+    run_import(card, library, "Temple", EXTS, group_by="trip", only=[str(p) for p in card.rglob("C.NEF")])
+    found = {t.title: t for t in trips.load_trips([str(library)], None)}
+    assert found["Rome"].photos == 2 and found["Temple"].photos == 1
+    assert found["Temple"].date_range == "Nov 20, 2026"

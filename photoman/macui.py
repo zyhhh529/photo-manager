@@ -5,7 +5,8 @@ import shutil
 import subprocess
 from pathlib import Path
 
-from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApplication, NSFloatingWindowLevel
+from AppKit import NSAlert, NSAlertFirstButtonReturn, NSApplication, NSFloatingWindowLevel, NSOpenPanel
+from Foundation import NSURL
 
 from .importer import is_writable
 
@@ -51,13 +52,22 @@ def notify(title: str, message: str, subtitle: str = "") -> None:
 
 
 def choose_folder(prompt: str, default: str = "/Volumes"):
-    """Folder picker; starts in /Volumes so external drives are one click away."""
-    script = f'POSIX path of (choose folder with prompt "{_esc(prompt)}"'
+    """Folder picker; starts in /Volumes so external drives are one click away. Runs in-process (a modal
+    NSOpenPanel), so the app keeps handling events while it's open instead of showing the spinning cursor."""
+    panel = NSOpenPanel.openPanel()
+    panel.setCanChooseFiles_(False)
+    panel.setCanChooseDirectories_(True)
+    panel.setCanCreateDirectories_(True)
+    panel.setAllowsMultipleSelection_(False)
+    panel.setMessage_(prompt)
+    panel.setPrompt_("Choose")
     if default and Path(default).is_dir():
-        script += f' default location (POSIX file "{_esc(default)}")'
-    r = subprocess.run(["osascript", "-e", "activate", "-e", script + ")"], capture_output=True, text=True)
-    path = r.stdout.strip()
-    return Path(path.rstrip("/") or "/") if r.returncode == 0 and path else None
+        panel.setDirectoryURL_(NSURL.fileURLWithPath_(default))
+    activate_app()
+    if panel.runModal() != 1:  # NSModalResponseOK
+        return None
+    path = panel.URL().path()
+    return Path(path.rstrip("/") or "/")
 
 
 def human_size(n: int) -> str:

@@ -22,7 +22,8 @@ Photos go wherever you choose, typically a folder on an external drive where you
 - Pick a recent destination or **Choose Other Folder…**; read-only drives (e.g. NTFS) and the card itself are refused
 - The last destination is remembered; if its drive isn't connected, the most recently used connected one is suggested
 - **Photos**: import everything, **only some days** (tick the shooting days), or **Choose photos…** (a Finder-style picker on the card: ⌘/Shift-click, Space to preview). The RAW/JPEG partner of a chosen photo always comes along. Files left out stay on the card, so it isn't reported safe to format; insert it again later to import the rest (what's already imported is skipped)
-- Progress and the result (safe to format or not, with Eject Card / Show in Finder) appear in the same window
+- Progress and the result (safe to format or not, with Eject Card / Show in Finder) appear in the same window. **Stop** halts an import between files; what's done is kept and the next import carries on
+- Next to the 📷 in the menu bar: `⇣ 12/160` for an import, `⇪` for a travel-drive backup and `☁ 155/1175` for Baidu Netdisk uploads (uploaded / everything that belongs in the cloud). When an import and an upload run together they're shown on two small lines, import on top
 - **Import Destination ▸** in the menu lists recent destinations (✓ = current) and lets you switch or choose a new folder
 - If the card is larger than the free space, you're warned before importing
 
@@ -31,11 +32,11 @@ Each destination keeps its own index, so duplicate detection works within a dest
 ## Archive layout
 
 ```
-<destination>/2026/2026-09-20_Rome/DSC_1234.NEF
+<destination>/2026/2026-09-20_Rome/DSC_1234.NEF      ← every photo of the trip, whatever day it was shot
 <destination>/2026/2026-09-20_Rome_Edited/          ← empty; export your Lightroom edits here
 ```
 
-- Folders are created by **each file's capture date**, so a trip spanning several days produces several date folders
+- **One folder per trip**, named after the trip's first day. A later card from the same trip (same name, within 30 days) goes into the same folder. Without a trip name, each import gets one folder named after its first day. To get one folder per shooting day instead, set `"group_by": "day"` in `~/.photoman/config.json`
 - Re-inserting a card never imports the same photo twice (hashes are recorded in `.photoman/index.sqlite` inside the destination)
 - Files with the same name but different content (camera file numbering wrapped around) are renamed to `DSC_1234_1.NEF`, never overwritten
 - Each file is first written as a `.part` temp file, re-read and checked against its SHA-256, and only then renamed to its final name

@@ -34,6 +34,8 @@ DEFAULT_CONFIG = {
     # Baidu Netdisk folder to upload into, e.g. "/照片备份". Empty: the app's own folder,
     # 我的应用数据/<app name> (/apps/<app name>)
     "cloud_root": "",
+    # Folders for imported photos: "trip" = one per trip (2026/2026-09-05_Rome), "day" = one per shooting day
+    "group_by": "trip",
     # Within this many days of the last import, the trip name defaults to the previous one
     "trip_name_reuse_days": 3,
 }

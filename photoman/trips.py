@@ -24,11 +24,12 @@ CACHE_PATH = config.HOME_DIR / "trips.json"
 class Trip:
     library_root: str
     name: str                          # "" when archived by date only
-    folders: List[str]                 # date folders, relative to library_root
+    folders: List[str]                 # photo folders (one per trip, or per day), relative to library_root
     edited_folder: Optional[str]       # relative to library_root
     imported_at: str                   # when the last import for this trip finished
     imports: int = 1
     shas: List[str] = field(default_factory=list)   # content of the originals imported for this trip
+    days: List[str] = field(default_factory=list)   # capture days (YYYY-MM-DD) of those originals
     # live status (see fill_status)
     connected: bool = True
     photos: int = 0                    # imported originals still in the library
@@ -44,7 +45,7 @@ class Trip:
 
     @property
     def date_range(self) -> str:
-        days = sorted(Path(f).name[:10] for f in self.folders)
+        days = self.days or sorted(Path(f).name[:10] for f in self.folders)  # older logs: from folder names
         lo, hi = datetime.strptime(days[0], "%Y-%m-%d"), datetime.strptime(days[-1], "%Y-%m-%d")
         if lo == hi:
             return f"{lo:%b} {lo.day}, {lo.year}"
@@ -54,7 +55,7 @@ class Trip:
 
     @property
     def first_day(self) -> str:
-        return min(Path(f).name[:10] for f in self.folders)
+        return min(self.days) if self.days else min(Path(f).name[:10] for f in self.folders)
 
     @property
     def backup_pending(self) -> Optional[int]:
@@ -86,19 +87,25 @@ def trips_from_logs(library_root: Path) -> List[Trip]:
             continue  # nothing new was imported
         root = d.get("library_root") or str(library_root)  # paths in the log may predate a rename
         folders = [_rel(f, root) for f in d["folders"]]
-        shas = [f["sha"] for f in d.get("files", []) if f.get("sha")]
+        # a photo belongs to the trip whose import copied it; files that import found already imported
+        # (e.g. the rest of the card, from an earlier trip) aren't part of this trip
+        copied = [f for f in d.get("files", []) if f.get("status") == "copied" and f.get("sha")]
+        shas = [f["sha"] for f in copied]
+        days = {f["captured"][:10] for f in copied if f.get("captured")}
         edited = d.get("edited_folder")
         edited = _rel(edited, root) if edited else str(edited_folder_for(Path(sorted(folders)[0])))
         t = trips.get(edited)
         if t:
             t.folders = sorted(set(t.folders) | set(folders))
             t.shas = sorted(set(t.shas) | set(shas))
+            t.days = sorted(set(t.days) | days)
             t.imports += 1
             t.imported_at = max(t.imported_at, d.get("finished_at", ""))
             t.name = t.name or d.get("trip", "")
         else:
             trips[edited] = Trip(library_root=str(library_root), name=d.get("trip", ""), folders=sorted(folders),
-                                 edited_folder=edited, imported_at=d.get("finished_at", ""), shas=sorted(set(shas)))
+                                 edited_folder=edited, imported_at=d.get("finished_at", ""), shas=sorted(set(shas)),
+                                 days=sorted(days))
     return list(trips.values())
 
 
