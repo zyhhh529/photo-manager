@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from . import config
-from .importer import (META_DIR, SETTLE_SECONDS, Index, backup_problem, edited_folder_for, files_in, raw_keys,
+from .importer import (JPEG_EXTS, META_DIR, SETTLE_SECONDS, Index, backup_problem, edited_folder_for, files_in, raw_keys,
                        reconcile_library, same_file, wanted_in_cloud, wanted_on_drive)
 
 CACHE_PATH = config.HOME_DIR / "trips.json"
@@ -28,6 +28,8 @@ class Trip:
     edited_folder: Optional[str]       # relative to library_root
     imported_at: str                   # when the last import for this trip finished
     imports: int = 1
+    first_imported_at: str = ""        # when the trip was first imported (the Trips list is in this order)
+    jpegs: int = 0                     # how many of the photos are JPEG/HEIF (the rest are RAW, video…)
     shas: List[str] = field(default_factory=list)   # content of the originals imported for this trip
     days: List[str] = field(default_factory=list)   # capture days (YYYY-MM-DD) of those originals
     # live status (see fill_status)
@@ -38,6 +40,7 @@ class Trip:
     originals_pending: Optional[int] = None   # None: no backup drive set, or it isn't usable right now
     edited_pending: Optional[int] = None
     cloud_pending: Optional[int] = None       # None: Baidu Netdisk isn't set up
+    cloud_total: int = 0                      # files of this trip that belong in the cloud
 
     @property
     def title(self) -> str:
@@ -101,10 +104,12 @@ def trips_from_logs(library_root: Path) -> List[Trip]:
             t.days = sorted(set(t.days) | days)
             t.imports += 1
             t.imported_at = max(t.imported_at, d.get("finished_at", ""))
+            t.first_imported_at = min(t.first_imported_at or d.get("finished_at", ""), d.get("finished_at", ""))
             t.name = t.name or d.get("trip", "")
         else:
             trips[edited] = Trip(library_root=str(library_root), name=d.get("trip", ""), folders=sorted(folders),
                                  edited_folder=edited, imported_at=d.get("finished_at", ""), shas=sorted(set(shas)),
+                                 first_imported_at=d.get("finished_at", ""),
                                  days=sorted(days))
     return list(trips.values())
 
@@ -134,6 +139,7 @@ def fill_status(trips: List[Trip], library_root: Path, backup_root: Optional[Pat
             prefixes = tuple(f.rstrip("/") + "/" for f in t.folders)
             originals = [(sha, rel) for sha, rel in rows if rel.startswith(prefixes) and (library_root / rel).is_file()]
         t.photos = len(originals)
+        t.jpegs = sum(1 for _, rel in originals if Path(rel).suffix.lower() in JPEG_EXTS)
         edited_dir = t.path(t.edited_folder) if t.edited_folder else None
         edits = list(files_in(edited_dir)) if edited_dir and edited_dir.is_dir() else []
         t.edited = len(edits)
@@ -152,10 +158,11 @@ def fill_status(trips: List[Trip], library_root: Path, backup_root: Optional[Pat
                 rec = clouded.get(rel)
                 return rec and rec[0] == st.st_size and abs(rec[1] - st.st_mtime) <= 2
             now = datetime.now().timestamp()
-            t.cloud_pending = sum(1 for _, rel in originals if wanted_in_cloud(rel, cloud_policy)
-                                  and not uploaded(rel, (library_root / rel).stat()))
-            t.cloud_pending += sum(1 for p, st in edits if now - st.st_mtime >= SETTLE_SECONDS
-                                   and not uploaded(str(p.relative_to(library_root)), st))
+            wanted = [rel for _, rel in originals if wanted_in_cloud(rel, cloud_policy)]
+            settled = [(p, st) for p, st in edits if now - st.st_mtime >= SETTLE_SECONDS]
+            t.cloud_total = len(wanted) + len(settled)
+            t.cloud_pending = sum(1 for rel in wanted if not uploaded(rel, (library_root / rel).stat()))
+            t.cloud_pending += sum(1 for p, st in settled if not uploaded(str(p.relative_to(library_root)), st))
         else:
             t.cloud_pending = None
 
@@ -193,4 +200,5 @@ def load_trips(libraries: List[str], backup_root: Optional[Path], policy: str = 
             trips = [Trip(**{**d, "connected": False}) for d in cache.get(lib, [])]
         out.extend(trips)
     _save_cache(cache)
-    return sorted(out, key=lambda t: (t.first_day, t.imported_at), reverse=True)
+    # first imported on top; trips cached before first_imported_at existed fall back to their last import
+    return sorted(out, key=lambda t: (t.first_imported_at or t.imported_at, t.first_day))

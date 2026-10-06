@@ -60,13 +60,14 @@ Each trip gets one empty `<first date>_<trip>_Edited` folder next to its date fo
 
 ## Trips
 
-Importing, editing and backing up often happen days or weeks apart. **Trips…** in the menu lists every import, grouped by trip, newest first:
+Importing, editing and backing up often happen days or weeks apart. **Trips…** in the menu lists every import, grouped by trip, in the order they were first imported (it updates by itself while open):
 
 | Column | Shows |
 |---|---|
-| Photos | Imported originals still in the destination |
+| Photos | Imported originals still in the destination, and how many are JPEG |
 | Edited | Files in the trip's Edited folder and when the last one was exported, or "not started" |
 | Backup | ✓ all backed up, or how many originals / edits are still waiting |
+| Baidu Netdisk | uploaded / total for the trip (adds up to the menu bar's ☁ count), or ✓ uploaded |
 
 Select a trip to **Show Originals** or **Open Edited Folder** (double-click works too). The list is built from the import logs kept in each destination (`.photoman/imports/`), so it includes imports from any day. Trips on drives that aren't connected are still listed, greyed out. Photoman remembers every destination you've used, and catch-up backups cover all of the connected ones.
 

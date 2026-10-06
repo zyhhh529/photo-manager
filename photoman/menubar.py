@@ -86,6 +86,7 @@ class PhotomanApp(rumps.App):
         self._ticks = 0
         self.window = None       # the open ImportWindow, if any
         self.trips_window = None
+        self._trips_refreshed = 0.0
         self.last_card = None
         self._dest_sig = None
 
@@ -98,6 +99,7 @@ class PhotomanApp(rumps.App):
         self.uploading = False   # Baidu Netdisk uploads run on their own thread, alongside imports and backups
         self.cloud_pending = 0
         self.cloud_progress = (0, 0)
+        self.cloud_total = 0     # uploaded + waiting, kept current while uploads run (see recount_cloud)
         self.cloud_problem = None
         self.eject_item = rumps.MenuItem("Eject Card")
         self.dest_menu = rumps.MenuItem("Import Destination")
@@ -258,6 +260,7 @@ class PhotomanApp(rumps.App):
     def tick(self, _):
         if self.busy:
             return
+        self.refresh_trips_soon(30)
         self.check_drives()
         current = {str(p) for p in find_cards()}
         new = sorted(current - self.seen)
@@ -455,6 +458,7 @@ class PhotomanApp(rumps.App):
         self.progress = (i, n)
         self.update_title()
         self.refresh_menu()
+        self.refresh_trips_soon(5)
 
     def on_backup_done(self, bak: Path, results, error, manual: bool):
         self.backing_up = False
@@ -500,7 +504,10 @@ class PhotomanApp(rumps.App):
 
     def start_cloud_upload(self):
         """Upload whatever isn't in Baidu Netdisk yet, from every connected destination, in the background."""
-        if self.uploading or self.cloud_problem or not baidu.is_set_up():
+        if self.uploading:
+            self.recount_cloud()  # e.g. photos just imported: they join the total now, and the next round
+            return
+        if self.cloud_problem or not baidu.is_set_up():
             return
         policy = self.cfg.get("cloud_originals", "jpeg")
         libs = self.connected_libraries()
@@ -512,8 +519,8 @@ class PhotomanApp(rumps.App):
             return
         self.uploading = True
         # overall progress: "☁ 147/1175" = uploaded so far / everything that belongs in the cloud
-        total = already + self.cloud_pending
-        self.cloud_progress = (already, total)
+        self.cloud_total = already + self.cloud_pending
+        self.cloud_progress = (already, self.cloud_total)
 
         def work():
             results, error = [], None
@@ -523,9 +530,8 @@ class PhotomanApp(rumps.App):
                 for lib in libs:
                     results.append(baidu.upload_library(
                         lib, client, policy,
-                        progress=lambda i, n, _name, base=done: callAfter(
-                            self.on_cloud_progress, base + i, max(total, base + n))))
-                    done += results[-1].uploaded + results[-1].failed
+                        progress=lambda i, n, _name, base=done: callAfter(self.on_cloud_progress, base + i)))
+                    done += results[-1].uploaded
             except Exception as e:
                 traceback.print_exc()
                 error = e
@@ -535,10 +541,20 @@ class PhotomanApp(rumps.App):
         self.refresh_cloud_item()
         self.update_title()
 
-    def on_cloud_progress(self, i: int, n: int):
-        self.cloud_progress = (i, n)
+    def recount_cloud(self):
+        """Refresh the total while an upload round runs, so photos imported (or edits exported) meanwhile show
+        up in "☁ 155/1175" right away; they're uploaded in the next round, which starts when this one ends."""
+        policy = self.cfg.get("cloud_originals", "jpeg")
+        counts = [baidu.cloud_counts(p, policy) for p in self.connected_libraries()]
+        self.cloud_pending = sum(waiting for _, waiting in counts)
+        self.cloud_total = sum(done for done, _ in counts) + self.cloud_pending
+        self.on_cloud_progress(self.cloud_progress[0])
+
+    def on_cloud_progress(self, i: int):
+        self.cloud_progress = (i, max(self.cloud_total, i))
         self.refresh_cloud_item()
         self.update_title()
+        self.refresh_trips_soon(5)  # after the menu bar, so both show the same moment
 
     def on_cloud_done(self, results, error):
         self.uploading = False
@@ -618,8 +634,9 @@ class PhotomanApp(rumps.App):
     def on_trips(self, _):
         if self.trips_window is None:
             self.trips_window = TripsWindow.alloc().init().setup(self)
+            self._trips_refreshed = time.time()
         else:
-            self.trips_window.reload()
+            self.refresh_trips()
             self.trips_window.show()
 
     def trips_window_closed(self, window):
@@ -629,6 +646,13 @@ class PhotomanApp(rumps.App):
     def refresh_trips(self):
         if self.trips_window is not None:
             self.trips_window.reload()
+            self._trips_refreshed = time.time()
+
+    def refresh_trips_soon(self, every: float):
+        """Keep an open Trips window current without re-reading the drives on every tick: at most once per
+        `every` seconds (5 s while backups/uploads progress, 30 s otherwise, e.g. for new Lightroom exports)."""
+        if self.trips_window is not None and time.time() - self._trips_refreshed >= every:
+            self.refresh_trips()
 
     def on_backup_now(self, _):
         self.start_backup(manual=True)

@@ -74,13 +74,14 @@ def test_status_counts_photos_edits_and_pending_backups(tmp_path, library):
     _export(library / "2026" / "2026-09-05_Rome_Edited" / "Web" / "DSC_0001.jpg")
 
     found = trips.load_trips([str(library)], None)
-    assert [t.title for t in found] == ["Paris", "Rome"]          # newest first
-    rome = found[1]
+    assert [t.title for t in found] == ["Rome", "Paris"]          # first imported on top
+    rome = found[0]
+    assert (rome.photos, rome.jpegs) == (2, 0)
     assert (rome.photos, rome.edited, rome.backup_pending) == (2, 2, None)
     assert rome.last_export is not None
 
     backup.mkdir()
-    rome = trips.load_trips([str(library)], backup)[1]
+    rome = trips.load_trips([str(library)], backup)[0]
     assert (rome.originals_pending, rome.edited_pending) == (2, 2)
 
 
@@ -175,3 +176,12 @@ def test_files_already_imported_by_another_trip_are_not_counted(tmp_path, librar
     found = {t.title: t for t in trips.load_trips([str(library)], None)}
     assert found["Rome"].photos == 2 and found["Temple"].photos == 1
     assert found["Temple"].date_range == "Nov 20, 2026"
+
+
+
+def test_jpeg_count(tmp_path, library):
+    card = _card(tmp_path, "c1", [("A.NEF", b"a", datetime(2026, 9, 5, 10)), ("A.JPG", b"aj", datetime(2026, 9, 5, 10)),
+                                  ("B.JPG", b"bj", datetime(2026, 9, 5, 11))])
+    run_import(card, library, "Rome", EXTS)
+    [t] = trips.load_trips([str(library)], None)
+    assert (t.photos, t.jpegs) == (3, 2)

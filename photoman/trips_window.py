@@ -20,10 +20,10 @@ from .trips import Trip, load_trips
 
 W, H = 1120, 440
 COLUMNS = [  # identifier, title, width
-    ("trip", "Trip", 170),
+    ("trip", "Trip", 160),
     ("dates", "Dates", 150),
-    ("dest", "Destination", 150),
-    ("photos", "Photos", 60),
+    ("dest", "Destination", 120),
+    ("photos", "Photos", 100),
     ("edited", "Edited", 160),
     ("backup", "Backup drive", 160),
     ("cloud", "Baidu Netdisk", 140),
@@ -43,7 +43,7 @@ def cell_text(t: Trip, column: str) -> str:
     if column == "dest":
         return f"{Path(t.library_root).name} on {drive_label(Path(t.library_root))}"
     if column == "photos":
-        return str(t.photos)
+        return f"{t.photos} ({t.jpegs} JPG)" if t.jpegs else str(t.photos)
     if column == "edited":
         if not t.connected:
             return f"{t.edited} files" if t.edited else "—"
@@ -65,7 +65,8 @@ def cell_text(t: Trip, column: str) -> str:
             return "—"
         if not t.connected:
             return "drive not connected"
-        return "✓ uploaded" if t.cloud_pending == 0 else f"{t.cloud_pending} waiting"
+        # same count as the menu bar's "☁ 211/2233": uploaded / everything of this trip that goes to the cloud
+        return "✓ uploaded" if t.cloud_pending == 0 else f"{t.cloud_total - t.cloud_pending}/{t.cloud_total} uploaded"
     return ""
 
 

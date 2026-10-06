@@ -353,13 +353,13 @@ def upload_library(library_root: Path, client: Baidu, policy: str, progress: Opt
             if (should_stop and should_stop()) or not library_root.is_dir():
                 res.stopped = True
                 break
-            if progress:
-                progress(i, len(todo), Path(rel).name)
             try:
                 info = client.upload(library_root / rel, rel)
                 index.mark_cloud(rel, root, st.st_size, st.st_mtime, str(info.get("fs_id", "")))
                 index.commit()
                 res.uploaded += 1
+                if progress:  # after the upload, so the count is files actually in the cloud
+                    progress(res.uploaded, len(todo), Path(rel).name)
             except BaiduAuthError:
                 res.stopped = True
                 raise
